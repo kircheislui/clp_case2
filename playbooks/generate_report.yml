@@ -9,4 +9,4 @@
     out_dir: "/srv/awx/reports"
     out_file: "{{ out_dir }}/windows_os_audit_report_mock.html"
   roles:
-  - win_audit
+    - win_audit
