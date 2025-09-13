@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ report_title }}</title>
+<style>
+  :root{
+    --bg:#0f172a;--text:#e5e7eb;--muted:#94a3b8;--line:#1f2937;
+    --host:#0b1220;--head:#12324a;--ok:#10b981;--fail:#ef4444;
+    --tblHead:#0f2333;--rowEven:#0f1927;--card:#111827;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  header{padding:20px 12px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0f172a,#0b1220)}
+  .container{max-width:1200px;margin:0 auto;padding:0 12px}
+  .title{font-size:20px;font-weight:700}
+  .brand{color:var(--muted);font-size:12px}
+  .meta{color:var(--muted);font-size:12px;margin-top:4px}
+  section.host{margin:16px 0;border-top:1px solid var(--line)}
+  .host-head{background:var(--host);padding:10px 12px;border-bottom:1px solid var(--line);color:#93c5fd;font-weight:700}
+  .note{color:var(--muted);font-weight:400;margin-left:8px}
+  .table{width:100%;border-collapse:collapse}
+  th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:var(--tblHead);color:#c7d2fe}
+  tr:nth-child(even) td{background:var(--rowEven)}
+  .status{font-weight:700;padding:4px 8px;border-radius:6px;display:inline-block}
+  .ok{background:rgba(16,185,129,.15);color:#a7f3d0;border:1px solid rgba(16,185,129,.35)}
+  .fail{background:rgba(239,68,68,.15);color:#fecaca;border:1px solid rgba(239,68,68,.35)}
+  pre{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin:12px 0}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  @media(max-width:720px){th,td{padding:8px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <div class="title">{{ report_title }}</div>
+    <div class="brand">{{ report_brand }}</div>
+    <div class="meta">Report Generated: {{ '%Y-%m-%dT%H:%M:%SZ' | strftime }}</div>
+  </div>
+</header>
+
+<main class="container">
+  {% for host_name, data in host_results | dictsort %}
+    <section class="host" id="{{ host_name | replace('.','-') }}">
+      <div class="host-head">Server: {{ host_name }}{% if data.note %}<span class="note">— {{ data.note }}</span>{% endif %}</div>
+      <div class="card">
+        <table class="table">
+          <thead>
+            <tr>
+              <th style="width:26%">Checking Item</th>
+              <th style="width:22%">Checking Command / Method</th>
+              <th style="width:22%">Expected Result</th>
+              <th style="width:22%">Actual Result</th>
+              <th style="width:8%">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for check in data.checks %}
+              {% set ctrl = os_controls | selectattr('code','equalto',check.control) | list | first %}
+              <tr>
+                <td>
+                  <div><strong>{{ check.control }}</strong></div>
+                  <div>{{ (ctrl.name if ctrl is defined else '') }}</div>
+                </td>
+                <td><pre>{{ check.method }}</pre></td>
+                <td><pre>{{ check.expected }}</pre></td>
+                <td><pre>{{ check.actual }}</pre></td>
+                <td>
+                  <span class="status {{ 'ok' if check.status | lower == 'ok' else 'fail' }}">
+                    {{ check.status }}
+                  </span>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endfor %}
+</main>
+</body>
+</html>
