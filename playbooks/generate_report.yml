@@ -1,7 +1,7 @@
 ---
 - name: Render Windows OS Audit Report from dummy data
-  hosts: localhost
-  connection: local
+  hosts: all
+  become: true
   gather_facts: false
   vars_files:
     - ../group_vars/all/vars.yml
