@@ -13,7 +13,7 @@
 
     - name: Render HTML report
       ansible.builtin.template:
-        src: "../roles/win_audit/templates/report.html.j2"
+        src: report.html.j2
         dest: "{{ out_file }}"
 
     - name: Show report path
