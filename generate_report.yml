@@ -4,7 +4,7 @@
   become: true
   gather_facts: false
   vars_files:
-    - ../group_vars/all/vars.yml
+    - group_vars/all/vars.yml
   vars:
     out_dir: "/srv/awx/reports"
     out_file: "{{ out_dir }}/windows_os_audit_report_mock.html"
