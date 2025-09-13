@@ -8,25 +8,5 @@
   vars:
     out_dir: "/srv/awx/reports"
     out_file: "{{ out_dir }}/windows_os_audit_report_mock.html"
-  tasks:
-    - name: Ensure output directory
-      ansible.builtin.file:
-        path: "{{ out_dir }}"
-        state: directory
-        mode: "0755"
-
-    - name: Build host_results structure from dummy servers
-      ansible.builtin.set_fact:
-        host_results: >-
-          {{
-            dict(servers | map(attribute='name') | zip(servers))
-          }}
-
-    - name: Render HTML report
-      ansible.builtin.template:
-        src: "../roles/win_audit/templates/report.html.j2"
-        dest: "{{ out_file }}"
-
-    - name: Show report path
-      ansible.builtin.debug:
-        msg: "Report generated: {{ out_file }}"
+  roles:
+  - win_audit
