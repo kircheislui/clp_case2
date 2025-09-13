@@ -5,7 +5,7 @@
   vars_files:
     - ../group_vars/all/vars.yml
   vars:
-    out_dir: "../outputs"
+    out_dir: "/srv/awx/reports"
     out_file: "{{ out_dir }}/windows_os_audit_report_mock.html"
   tasks:
     - name: Ensure output directory
