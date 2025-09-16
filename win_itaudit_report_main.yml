@@ -1,7 +1,7 @@
 ---
 # Play 1: Collect from Windows
 - name: Windows OS compliance scan
-  hosts: windows
+  hosts: "{{ target_hosts | default('auditWin') }}"
   gather_facts: false
   roles:
     - role: windows_compliance_scan
@@ -12,11 +12,12 @@
   gather_facts: false
   vars:
     report_title: "{{ report_title | default('Windows Security Compliance Report') }}"
+    effective_group: "{{ target_hosts | default('auditWin') }}"
   tasks:
-    - name: Build host_results from hostvars
+    - name: Build host_results from selected group
       set_fact:
         host_results: "{{ host_results | default({}) | combine({ item: hostvars[item]['win_os_checks_struct'][item] }, recursive=True) }}"
-      loop: "{{ groups['windows'] | default([]) }}"
+      loop: "{{ groups[effective_group] | default([]) }}"
       when: hostvars[item].win_os_checks_struct is defined
 
     - name: Render HTML report to string

@@ -2,19 +2,29 @@
 - name: B7 | Get-HotFix (latest 5)
   ansible.windows.win_powershell:
     script: |
-      Get-HotFix | Sort-Object -Property InstalledOn -Descending |
-      Select-Object -First 5 HotFixID, Description, InstalledOn |
-      ConvertTo-Json
+      try {
+        Get-HotFix | Sort-Object -Property InstalledOn -Descending |
+        Select-Object -First 5 HotFixID, Description, InstalledOn |
+        ConvertTo-Json
+      } catch {
+        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
+      }
   register: b7
 
 - name: B7 | Build/Eval
   set_fact:
-    b7_list: "{{ b7.stdout | from_json }}"
+    b7_json: "{{ b7.stdout | from_json }}"
+    b7_error: "{{ b7_json.error is defined }}"
+    b7_list: "{{ b7_json if (b7_json | type_debug) == 'list' else [] }}"
     b7_actual: |-
+      {% if b7_error %}
+      Error: {{ b7_json.error }}
+      {% else %}
       {% for h in b7_list %}
       {{ h.HotFixID }}  {{ h.Description }}  InstalledOn: {{ h.InstalledOn }}
       {% endfor %}
-    b7_status: "OK"  # Keep neutral unless you add date math with culture-safe parsing
+      {% endif %}
+    b7_status: "{{ 'OK' if not b7_error else ((safe_mode | bool) | ternary('Unknown','Fail')) }}"
 
 - name: B7 | Append
   set_fact:

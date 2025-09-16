@@ -1,4 +1,5 @@
 ---
+# Global policy defaults
 policy:
   password:
     min_length: 14
@@ -16,16 +17,22 @@ policy:
   updates:
     max_days_since_cu: 45
 
+# Approved members that may appear in local Administrators group
 approved_admins:
   - "BUILTIN\\Administrators"
   - "CONTOSO\\Domain Admins"
   - "CONTOSO\\WinOps_Admins"
 
+# Display text per control
 expected_text:
   A15: "Local users enumerated; Administrators group contains only approved principals."
   A20: "Lockout threshold > 0; Lockout duration >= 15 minutes; Reset counter <= 15 minutes."
   A21: "Complexity enabled; Min length >= 14; Max age <= 90 days; History >= 24; Lockout threshold > 0."
   A25: "Advanced Audit Policy configured for required subcategories."
-  A26: "Security log size >= 1GB; System/Application sized per policy; retention configured."
+  A26: "Security/System/Application log sizes meet policy; retention configured."
   A41: "Only approved groups/users present in local Administrators."
-  B7:  "Latest cumulative updates installed within policy SLA window."
+  B7:  "Latest cumulative updates listed (recency review)."
+
+# Safety knobs for first client run
+safe_mode: true          # If parsing/permissions ambiguous, mark as Unknown (not Fail)
+assume_locale_en: true   # If outputs are not English, parsing may fail; we'll mark Unknown

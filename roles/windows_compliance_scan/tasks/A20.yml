@@ -5,14 +5,19 @@
 
 - name: A20 | Parse/Eval
   set_fact:
-    a20_threshold: "{{ (netacc.stdout | regex_search('Lockout threshold:\\s*(\\d+)', '\\1')) | int }}"
-    a20_duration: "{{ (netacc.stdout | regex_search('Lockout duration.*:\\s*(\\d+)', '\\1')) | int }}"
-    a20_window: "{{ (netacc.stdout | regex_search('Lockout observation window.*:\\s*(\\d+)', '\\1')) | int }}"
+    a20_threshold: "{{ (netacc.stdout | regex_search('Lockout threshold:\\s*(\\d+)', '\\1') | default('')) | int }}"
+    a20_duration: "{{ (netacc.stdout | regex_search('Lockout duration.*:\\s*(\\d+)', '\\1') | default('')) | int }}"
+    a20_window:   "{{ (netacc.stdout | regex_search('Lockout observation window.*:\\s*(\\d+)', '\\1') | default('')) | int }}"
+    a20_parsed_ok: "{{ a20_threshold|string != '0' or a20_duration|string != '0' or a20_window|string != '0' }}"
     a20_status: >-
       {{
-        (a20_threshold >= policy.lockout.threshold_min and
-         a20_duration >= policy.lockout.duration_min and
-         a20_window >= policy.lockout.window_min) | ternary('OK','Fail')
+        (
+          a20_parsed_ok and
+          a20_threshold >= policy.lockout.threshold_min and
+          a20_duration >= policy.lockout.duration_min and
+          a20_window   >= policy.lockout.window_min
+        )
+        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
       }}
 
 - name: A20 | Append

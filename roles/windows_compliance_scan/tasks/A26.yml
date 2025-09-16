@@ -1,29 +1,28 @@
 ---
 - name: A26 | wevtutil gl Security/System/Application
   vars:
-    logs:
-      - Security
-      - System
-      - Application
+    logs: [Security, System, Application]
   ansible.windows.win_shell: "wevtutil gl {{ item }}"
   loop: "{{ logs }}"
   register: a26
 
-- name: A26 | Parse sizes and build actual
+- name: A26 | Parse sizes and evaluate
   set_fact:
-    sec_kb: "{{ (a26.results | selectattr('item','equalto','Security') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | int }}"
-    sys_kb: "{{ (a26.results | selectattr('item','equalto','System') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | int }}"
-    app_kb: "{{ (a26.results | selectattr('item','equalto','Application') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | int }}"
+    sec_kb: "{{ (a26.results | selectattr('item','equalto','Security') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
+    sys_kb: "{{ (a26.results | selectattr('item','equalto','System') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
+    app_kb: "{{ (a26.results | selectattr('item','equalto','Application') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
+    a26_parsed_ok: "{{ (sec_kb > 0) or (sys_kb > 0) or (app_kb > 0) }}"
     a26_actual: |-
       Security MaxSize: {{ (sec_kb/1024)|round(0,'floor') }} MB
       System   MaxSize: {{ (sys_kb/1024)|round(0,'floor') }} MB
       Application MaxSize: {{ (app_kb/1024)|round(0,'floor') }} MB
     a26_status: >-
       {{
-        (sec_kb >= policy.logs.security_min_mb*1024) and
-        (sys_kb >= policy.logs.system_min_mb*1024) and
-        (app_kb >= policy.logs.application_min_mb*1024)
-        | ternary('OK','Fail')
+        (a26_parsed_ok and
+         (sec_kb >= policy.logs.security_min_mb*1024) and
+         (sys_kb >= policy.logs.system_min_mb*1024) and
+         (app_kb >= policy.logs.application_min_mb*1024))
+        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
       }}
 
 - name: A26 | Append

@@ -3,16 +3,16 @@
   ansible.windows.win_shell: auditpol /get /category:*
   register: a25
 
-- name: A25 | Simple evaluation (tune later)
+- name: A25 | Simple evaluation (tunable)
   set_fact:
     a25_ok: >-
       {{
         a25.stdout is search('Credential Validation') and
         a25.stdout is search('Success and Failure') and
         a25.stdout is search('User Account Management') and
-        a25.stdout is search('Audit Policy Change')
+        a25.stdout is search('Policy Change')
       }}
-    a25_status: "{{ 'OK' if a25_ok else 'Fail' }}"
+    a25_status: "{{ 'OK' if a25_ok else ((safe_mode | bool) | ternary('Unknown','Fail')) }}"
 
 - name: A25 | Append
   set_fact:

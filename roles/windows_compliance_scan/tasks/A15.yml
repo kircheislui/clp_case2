@@ -2,27 +2,39 @@
 - name: A15 | Get local users and Administrators group members
   ansible.windows.win_powershell:
     script: |
-      $users = Get-LocalUser | Select-Object Name,Enabled
-      $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name
-      [PSCustomObject]@{ users=$users; admins=$admins } | ConvertTo-Json
+      try {
+        $users = Get-LocalUser | Select-Object Name,Enabled
+        $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name
+        [PSCustomObject]@{ users=$users; admins=$admins } | ConvertTo-Json
+      } catch {
+        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
+      }
   register: a15
 
-- name: A15 | Build actual text
+- name: A15 | Build/Eval
   set_fact:
-    a15_data: "{{ a15.stdout | from_json }}"
+    a15_json: "{{ (a15.stdout | from_json) if (a15.stdout | default('') | regex_search('^[{\\[]')) else {'error': a15.stdout} }}"
+    a15_has_error: "{{ a15_json.error is defined }}"
+    a15_users: "{{ (a15_json.users | default([])) }}"
+    a15_admins: "{{ (a15_json.admins | default([])) }}"
     a15_actual: |-
+      {% if a15_has_error %}
+      Error: {{ a15_json.error }}
+      {% else %}
       Local Users:
-      {% for u in a15_data.users %}
+      {% for u in a15_users %}
         - Name: {{ u.Name }}, Enabled: {{ u.Enabled }}
       {% endfor %}
       Administrators Group:
-      {% for m in a15_data.admins %}
+      {% for m in a15_admins %}
         - {{ m }}
       {% endfor %}
-
-- name: A15 | Evaluate
-  set_fact:
-    a15_status: "{{ 'OK' if (a15_data.admins | difference(approved_admins) | length == 0) else 'Fail' }}"
+      {% endif %}
+    a15_status: >-
+      {{
+        (not a15_has_error and (a15_admins | difference(approved_admins) | length == 0))
+        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+      }}
 
 - name: A15 | Append
   set_fact:

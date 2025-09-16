@@ -1,12 +1,38 @@
 ---
-- name: Include default policy/expected text
+# Include policy/safety defaults
+- name: Load defaults
   include_vars:
     file: "{{ playbook_dir }}/../defaults/main.yml"
 
-- name: Init per-host results container
+# Preflight info to help interpret results
+- name: Preflight | gather basics
+  ansible.windows.win_powershell:
+    script: |
+      $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+      $ver = $PSVersionTable.PSVersion.ToString()
+      $culture = (Get-Culture).Name
+      [PSCustomObject]@{ IsAdmin=$isAdmin; PSVersion=$ver; Culture=$culture } | ConvertTo-Json -Compress
+  register: preflight
+
+- name: Initialize per-host results structure
   set_fact:
     win_os_checks_struct: "{{ { inventory_hostname: {'name': inventory_hostname, 'note': '', 'checks': [] } } }}"
 
+- name: Record preflight row
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'INFO',
+          'method':'PowerShell: Preflight (IsAdmin, PSVersion, Culture)',
+          'expected':'Admin recommended; PS 5.1+; Culture en-* for parsing',
+          'actual': ('IsAdmin: ' ~ ((preflight.stdout|from_json).IsAdmin|string) ~ '\nPSVersion: ' ~ (preflight.stdout|from_json).PSVersion ~ '\nCulture: ' ~ (preflight.stdout|from_json).Culture),
+          'status': (((preflight.stdout|from_json).IsAdmin) | ternary('OK','Unknown'))
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"
+
+# Controls
 - include_tasks: A15.yml
 - include_tasks: A20.yml
 - include_tasks: A21.yml

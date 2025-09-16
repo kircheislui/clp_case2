@@ -2,18 +2,32 @@
 - name: A41 | Administrators membership
   ansible.windows.win_powershell:
     script: |
-      Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name | ConvertTo-Json
+      try {
+        Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name | ConvertTo-Json
+      } catch {
+        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
+      }
   register: a41
 
 - name: A41 | Build/Eval
   set_fact:
-    a41_list: "{{ a41.stdout | from_json }}"
+    a41_json: "{{ (a41.stdout | from_json) if (a41.stdout | default('') | regex_search('^[{\\[]')) else {'error': a41.stdout} }}"
+    a41_error: "{{ a41_json.error is defined }}"
+    a41_list: "{{ a41_json if (a41_json | type_debug) == 'list' else [] }}"
     a41_actual: |-
+      {% if a41_error %}
+      Error: {{ a41_json.error }}
+      {% else %}
       Administrators:
       {% for m in a41_list %}
         - {{ m }}
       {% endfor %}
-    a41_status: "{{ 'OK' if (a41_list | difference(approved_admins) | length == 0) else 'Fail' }}"
+      {% endif %}
+    a41_status: >-
+      {{
+        (not a41_error and (a41_list | difference(approved_admins) | length == 0))
+        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+      }}
 
 - name: A41 | Append
   set_fact:

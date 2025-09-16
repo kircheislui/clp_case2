@@ -5,146 +5,86 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ report_title }}</title>
 <style>
-  /* Base */
   :root{
-    --text:#222;
-    --muted:#6b7280;
-    --border:#e5e7eb;
-    --tableHead:#eef2f7;
-    --serverBar:#173d6b;      /* deep blue like sample */
-    --serverBarText:#e6eef9;
-    --okRow:#e7f6ec;          /* light green row background */
-    --okBadge:#16a34a;        /* green badge text/border */
-    --okBox:#e9f7ef;          /* pale green code box */
-    --failRow:#fde8e8;        /* light red row background */
-    --failBadge:#dc2626;      /* red badge text/border */
-    --failBox:#fdeaea;        /* pale red code box */
-    --white:#fff;
+    --text:#222; --muted:#6b7280; --border:#e5e7eb; --tableHead:#eef2f7;
+    --serverBar:#173d6b; --serverBarText:#e6eef9;
+    --okRow:#e7f6ec; --okBadge:#16a34a; --okBox:#e9f7ef;
+    --failRow:#fde8e8; --failBadge:#dc2626; --failBox:#fdeaea;
+    --unkRow:#fff7ed; --unkBadge:#92400e; --unkBox:#fff1e6;
   }
   *{box-sizing:border-box}
-  body{
-    margin:0;
-    color:var(--text);
-    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial;
-    background:#fafafa;
-  }
-  header{
-    padding:18px 16px 10px;
-    border-bottom:1px solid var(--border);
-    background:#fff;
-  }
+  body{margin:0;color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial;background:#fafafa}
+  header{padding:18px 16px 10px;border-bottom:1px solid var(--border);background:#fff}
   .container{max-width:1100px;margin:0 auto;padding:0 12px}
-  .title{
-    font-size:22px;font-weight:700;color:#b91c1c; /* red title like sample */
-    margin-bottom:2px;
-  }
-  .meta{
-    font-size:12px;color:var(--muted);
-    margin-top:6px;
-  }
-
-  /* Table */
+  .title{font-size:22px;font-weight:700;color:#b91c1c;margin-bottom:2px}
+  .meta{font-size:12px;color:var(--muted);margin-top:6px}
   table{width:100%;border-collapse:collapse;background:#fff}
-  th,td{
-    border:1px solid var(--border);
-    padding:10px 12px; vertical-align:top; text-align:left;
-  }
-  th{
-    background:var(--tableHead);
-    color:#111827;
-    font-weight:700;
-  }
-
-  /* Server header row */
-  .server-row th{
-    background:var(--serverBar);
-    color:var(--serverBarText);
-    font-weight:700;
-    border-color:var(--serverBar);
-    font-size:15px;
-  }
-
-  /* Status badge */
-  .status{
-    display:inline-block; font-weight:700; padding:2px 10px; border-radius:999px;
-    border:2px solid; min-width:54px; text-align:center;
-  }
-  .status.ok{ color:var(--okBadge); border-color:var(--okBadge); background:#f0fff4; }
-  .status.fail{ color:var(--failBadge); border-color:var(--failBadge); background:#fff5f5; }
-
-  /* Row tint */
-  tr.ok td{ background:var(--okRow); }
-  tr.fail td{ background:var(--failRow); }
-
-  /* “Input-like” boxes for command/expected/actual */
-  pre{
-    margin:0;
-    white-space:pre-wrap;
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    font-size:12px;
-    line-height:1.45;
-    padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#f9fafb;
-  }
-  .ok pre.actual{ background:var(--okBox); }
-  .fail pre.actual{ background:var(--failBox); }
-
-  /* Section spacing */
+  th,td{border:1px solid var(--border);padding:10px 12px;vertical-align:top;text-align:left}
+  th{background:var(--tableHead);color:#111827;font-weight:700}
+  .server-row th{background:var(--serverBar);color:var(--serverBarText);font-weight:700;border-color:var(--serverBar);font-size:15px}
+  .status{display:inline-block;font-weight:700;padding:2px 10px;border-radius:999px;border:2px solid;min-width:54px;text-align:center}
+  .status.ok{color:var(--okBadge);border-color:var(--okBadge);background:#f0fff4}
+  .status.fail{color:var(--failBadge);border-color:var(--failBadge);background:#fff5f5}
+  .status.unknown{color:var(--unkBadge);border-color:var(--unkBadge);background:#fff7ed}
+  tr.ok td{background:var(--okRow)}
+  tr.fail td{background:var(--failRow)}
+  tr.unknown td{background:var(--unkRow)}
+  pre{margin:0;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#f9fafb}
+  .ok pre.actual{background:var(--okBox)}
+  .fail pre.actual{background:var(--failBox)}
+  .unknown pre.actual{background:var(--unkBox)}
   section{margin:18px 0}
-  .server-title{font-weight:700}
-
-  @media(max-width:900px){
-    th:nth-child(1){width:26%}
-    th:nth-child(2),th:nth-child(3),th:nth-child(4){width:auto}
-    th:nth-child(5){width:10%}
-  }
+  @media(max-width:900px){ th:nth-child(1){width:26%} th:nth-child(5){width:10%} }
 </style>
 </head>
 <body>
 <header>
   <div class="container">
     <div style="font-size:18px;color:#374151;margin:0 0 6px 0;">5.2. Sample HTML Report Output</div>
-    <div class="title">Ansible: Windows Security Compliance Report</div>
+    <div class="title">{{ report_title | default('Windows Security Compliance Report') }}</div>
     <div class="meta">Report Generated: {{ '%Y-%m-%dT%H:%M:%SZ' | strftime }}</div>
   </div>
 </header>
 
 <main class="container">
   {% for host_name, data in host_results | dictsort %}
-    <section id="{{ host_name | replace('.','-') }}">
-      <table>
-        <thead>
-          <tr class="server-row">
-            <th colspan="5">Server: {{ data.name | default(host_name) }}{% if data.note %} -- {{ data.note }}{% endif %}</th>
+  <section id="{{ host_name | replace('.','-') }}">
+    <table>
+      <thead>
+        <tr class="server-row">
+          <th colspan="5">Server: {{ data.name | default(host_name) }}{% if data.note %} -- {{ data.note }}{% endif %}</th>
+        </tr>
+        <tr>
+          <th>Checking Item</th>
+          <th>Checking Command / Method</th>
+          <th>Expected Result</th>
+          <th>Actual Result</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for check in data.checks | default([]) %}
+          {% set status_l = check.status | string | trim | lower %}
+          {% set rowClass = 'ok' if status_l == 'ok' else ('fail' if status_l == 'fail' else 'unknown') %}
+          {% set ctrl = (os_controls | default([])) | selectattr('code','equalto',check.control) | list | first %}
+          <tr class="{{ rowClass }}">
+            <td>
+              <div style="font-weight:700;margin-bottom:4px">{{ check.control }}</div>
+              <div style="color:#374151">{{ (ctrl.name if ctrl is defined else '') }}</div>
+            </td>
+            <td><pre class="cmd">{{ check.method | default('') }}</pre></td>
+            <td><pre class="expected">{{ check.expected | default('') }}</pre></td>
+            <td><pre class="actual">{{ check.actual | default('') }}</pre></td>
+            <td><span class="status {{ rowClass }}">{{ status_l|capitalize if status_l else 'Unknown' }}</span></td>
           </tr>
-          <tr>
-            <th>Checking Item</th>
-            <th>Checking Command / Method</th>
-            <th>Expected Result</th>
-            <th>Actual Result</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for check in data.checks | default([]) %}
-            {% set ok = (check.status | string | trim | lower == 'ok') %}
-            {% set rowClass = 'ok' if ok else 'fail' %}
-            {% set ctrl = (os_controls | default([])) | selectattr('code','equalto',check.control) | list | first %}
-            <tr class="{{ rowClass }}">
-              <td>
-                <div style="font-weight:700;margin-bottom:4px">{{ check.control }}</div>
-                <div style="color:#374151">{{ (ctrl.name if ctrl is defined else '') }}</div>
-              </td>
-              <td><pre class="cmd">{{ check.method | default('') }}</pre></td>
-              <td><pre class="expected">{{ check.expected | default('') }}</pre></td>
-              <td><pre class="actual">{{ check.actual | default('') }}</pre></td>
-              <td>
-                <span class="status {{ 'ok' if ok else 'fail' }}">{{ 'OK' if ok else 'Fail' }}</span>
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </section>
+        {% else %}
+          <tr><td colspan="5" style="color:#6b7280">No checks collected for this host.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% else %}
+    <p style="color:#6b7280">No hosts to display.</p>
   {% endfor %}
 </main>
 </body>

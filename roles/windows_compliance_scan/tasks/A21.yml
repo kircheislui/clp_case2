@@ -14,25 +14,33 @@
           LockoutDurationMins=[int]$p.LockoutDuration.TotalMinutes
         } | ConvertTo-Json -Compress
       } catch {
-        secedit /export /cfg $env:TEMP\secpol.inf *> $null
-        $cfg = Get-Content $env:TEMP\secpol.inf
-        function Val($k){ ($cfg | Where-Object {$_ -match "^$k"}).Split('=')[-1].Trim() }
-        [PSCustomObject]@{
-          Scope='Local'
-          ComplexityEnabled=([int](Val 'PasswordComplexity') -eq 1)
-          MinPasswordLength=[int](Val 'MinimumPasswordLength')
-          MaxPasswordAgeDays=[int](Val 'MaximumPasswordAge')
-          PasswordHistoryCount=[int](Val 'PasswordHistorySize')
-          LockoutThreshold=[int](Val 'LockoutBadCount')
-          LockoutDurationMins=[int](Val 'LockoutDuration')
-        } | ConvertTo-Json -Compress
+        try {
+          secedit /export /cfg $env:TEMP\secpol.inf *> $null
+          $cfg = Get-Content $env:TEMP\secpol.inf
+          function Val($k){ ($cfg | Where-Object {$_ -match "^$k"}).Split('=')[-1].Trim() }
+          [PSCustomObject]@{
+            Scope='Local'
+            ComplexityEnabled=([int](Val 'PasswordComplexity') -eq 1)
+            MinPasswordLength=[int](Val 'MinimumPasswordLength')
+            MaxPasswordAgeDays=[int](Val 'MaximumPasswordAge')
+            PasswordHistoryCount=[int](Val 'PasswordHistorySize')
+            LockoutThreshold=[int](Val 'LockoutBadCount')
+            LockoutDurationMins=[int](Val 'LockoutDuration')
+          } | ConvertTo-Json -Compress
+        } catch {
+          [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json -Compress
+        }
       }
   register: a21
 
 - name: A21 | Build/Eval
   set_fact:
     a21_obj: "{{ a21.stdout | from_json }}"
+    a21_error: "{{ a21_obj.error is defined }}"
     a21_actual: |-
+      {% if a21_error %}
+      Error: {{ a21_obj.error }}
+      {% else %}
       Scope: {{ a21_obj.Scope }}
       ComplexityEnabled: {{ a21_obj.ComplexityEnabled }}
       MinPasswordLength: {{ a21_obj.MinPasswordLength }}
@@ -40,14 +48,16 @@
       MaxPasswordAgeDays: {{ a21_obj.MaxPasswordAgeDays }}
       LockoutThreshold: {{ a21_obj.LockoutThreshold }}
       LockoutDurationMins: {{ a21_obj.LockoutDurationMins }}
+      {% endif %}
     a21_status: >-
       {{
-        (a21_obj.ComplexityEnabled and
-         (a21_obj.MinPasswordLength|int) >= policy.password.min_length and
-         (a21_obj.MaxPasswordAgeDays|int) <= policy.password.max_age_days and
-         (a21_obj.PasswordHistoryCount|int) >= policy.password.history and
-         (a21_obj.LockoutThreshold|int) >= policy.lockout.threshold_min)
-        | ternary('OK','Fail')
+        (not a21_error and
+         (a21_obj.ComplexityEnabled | bool) and
+         (a21_obj.MinPasswordLength | int) >= policy.password.min_length and
+         (a21_obj.MaxPasswordAgeDays | int) <= policy.password.max_age_days and
+         (a21_obj.PasswordHistoryCount | int) >= policy.password.history and
+         (a21_obj.LockoutThreshold | int) >= policy.lockout.threshold_min)
+        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
       }}
 
 - name: A21 | Append

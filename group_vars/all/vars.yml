@@ -1,8 +1,8 @@
 ---
-# Where to persist on the AWX host. Ensure this path is exposed in AWX Settings → Jobs.
+# Where the rendered HTML should be persisted on the AWX controller host
 artifact:
   to_path: true
-  path: "/srv/awx-artifacts/reports"
+  path: "/srv/awx-artifacts/reports"   # Make sure this is exposed in AWX Settings → Jobs
   to_stdout: false
   to_email: false
 
@@ -15,3 +15,13 @@ smtp:
     - you@yourdomain.com
 
 report_title: "Windows Security Compliance Report"
+
+# Optional control name map for the template (helps show friendly names)
+os_controls:
+  - { code: "A15", name: "List of Windows Local Users and Administrators Group" }
+  - { code: "A20", name: "Account Lockout Configuration" }
+  - { code: "A21", name: "Password Policy" }
+  - { code: "A25", name: "Advanced Audit Policy" }
+  - { code: "A26", name: "Event Log Size/Retention" }
+  - { code: "A41", name: "Local Administrators Membership" }
+  - { code: "B7",  name: "Installed Hotfixes" }
