@@ -1,0 +1,39 @@
+---
+- name: A15 | Get local users and Administrators group members
+  ansible.windows.win_powershell:
+    script: |
+      $users = Get-LocalUser | Select-Object Name,Enabled
+      $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name
+      [PSCustomObject]@{ users=$users; admins=$admins } | ConvertTo-Json
+  register: a15
+
+- name: A15 | Build actual text
+  set_fact:
+    a15_data: "{{ a15.stdout | from_json }}"
+    a15_actual: |-
+      Local Users:
+      {% for u in a15_data.users %}
+        - Name: {{ u.Name }}, Enabled: {{ u.Enabled }}
+      {% endfor %}
+      Administrators Group:
+      {% for m in a15_data.admins %}
+        - {{ m }}
+      {% endfor %}
+
+- name: A15 | Evaluate
+  set_fact:
+    a15_status: "{{ 'OK' if (a15_data.admins | difference(approved_admins) | length == 0) else 'Fail' }}"
+
+- name: A15 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'A15',
+          'method':'PowerShell: Get-LocalUser; Get-LocalGroupMember -Group "Administrators"',
+          'expected': expected_text.A15,
+          'actual': a15_actual,
+          'status': a15_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

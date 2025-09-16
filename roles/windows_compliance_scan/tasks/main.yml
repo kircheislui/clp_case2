@@ -1,0 +1,16 @@
+---
+- name: Include default policy/expected text
+  include_vars:
+    file: "{{ playbook_dir }}/../defaults/main.yml"
+
+- name: Init per-host results container
+  set_fact:
+    win_os_checks_struct: "{{ { inventory_hostname: {'name': inventory_hostname, 'note': '', 'checks': [] } } }}"
+
+- include_tasks: A15.yml
+- include_tasks: A20.yml
+- include_tasks: A21.yml
+- include_tasks: A25.yml
+- include_tasks: A26.yml
+- include_tasks: A41.yml
+- include_tasks: B7.yml

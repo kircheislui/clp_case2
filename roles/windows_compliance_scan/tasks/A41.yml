@@ -1,0 +1,30 @@
+---
+- name: A41 | Administrators membership
+  ansible.windows.win_powershell:
+    script: |
+      Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name | ConvertTo-Json
+  register: a41
+
+- name: A41 | Build/Eval
+  set_fact:
+    a41_list: "{{ a41.stdout | from_json }}"
+    a41_actual: |-
+      Administrators:
+      {% for m in a41_list %}
+        - {{ m }}
+      {% endfor %}
+    a41_status: "{{ 'OK' if (a41_list | difference(approved_admins) | length == 0) else 'Fail' }}"
+
+- name: A41 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'A41',
+          'method':'PowerShell: Get-LocalGroupMember -Group "Administrators"',
+          'expected': expected_text.A41,
+          'actual': a41_actual,
+          'status': a41_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

@@ -1,0 +1,31 @@
+---
+policy:
+  password:
+    min_length: 14
+    max_age_days: 90
+    history: 24
+    complexity: true
+  lockout:
+    threshold_min: 1
+    duration_min: 15
+    window_min: 15
+  logs:
+    security_min_mb: 1024
+    system_min_mb: 512
+    application_min_mb: 512
+  updates:
+    max_days_since_cu: 45
+
+approved_admins:
+  - "BUILTIN\\Administrators"
+  - "CONTOSO\\Domain Admins"
+  - "CONTOSO\\WinOps_Admins"
+
+expected_text:
+  A15: "Local users enumerated; Administrators group contains only approved principals."
+  A20: "Lockout threshold > 0; Lockout duration >= 15 minutes; Reset counter <= 15 minutes."
+  A21: "Complexity enabled; Min length >= 14; Max age <= 90 days; History >= 24; Lockout threshold > 0."
+  A25: "Advanced Audit Policy configured for required subcategories."
+  A26: "Security log size >= 1GB; System/Application sized per policy; retention configured."
+  A41: "Only approved groups/users present in local Administrators."
+  B7:  "Latest cumulative updates installed within policy SLA window."

@@ -1,0 +1,30 @@
+---
+- name: A20 | net accounts
+  ansible.windows.win_shell: net accounts
+  register: netacc
+
+- name: A20 | Parse/Eval
+  set_fact:
+    a20_threshold: "{{ (netacc.stdout | regex_search('Lockout threshold:\\s*(\\d+)', '\\1')) | int }}"
+    a20_duration: "{{ (netacc.stdout | regex_search('Lockout duration.*:\\s*(\\d+)', '\\1')) | int }}"
+    a20_window: "{{ (netacc.stdout | regex_search('Lockout observation window.*:\\s*(\\d+)', '\\1')) | int }}"
+    a20_status: >-
+      {{
+        (a20_threshold >= policy.lockout.threshold_min and
+         a20_duration >= policy.lockout.duration_min and
+         a20_window >= policy.lockout.window_min) | ternary('OK','Fail')
+      }}
+
+- name: A20 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'A20',
+          'method':'net accounts',
+          'expected': expected_text.A20,
+          'actual': netacc.stdout,
+          'status': a20_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

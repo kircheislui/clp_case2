@@ -114,7 +114,7 @@
       <table>
         <thead>
           <tr class="server-row">
-            <th colspan="5">Server: {{ host_name }}{% if data.note %} — {{ data.note }}{% endif %}</th>
+            <th colspan="5">Server: {{ data.name | default(host_name) }}{% if data.note %} -- {{ data.note }}{% endif %}</th>
           </tr>
           <tr>
             <th>Checking Item</th>
@@ -125,18 +125,18 @@
           </tr>
         </thead>
         <tbody>
-          {% for check in data.checks %}
-            {% set ok = (check.status | lower == 'ok') %}
+          {% for check in data.checks | default([]) %}
+            {% set ok = (check.status | string | trim | lower == 'ok') %}
             {% set rowClass = 'ok' if ok else 'fail' %}
-            {% set ctrl = os_controls | selectattr('code','equalto',check.control) | list | first %}
+            {% set ctrl = (os_controls | default([])) | selectattr('code','equalto',check.control) | list | first %}
             <tr class="{{ rowClass }}">
               <td>
                 <div style="font-weight:700;margin-bottom:4px">{{ check.control }}</div>
                 <div style="color:#374151">{{ (ctrl.name if ctrl is defined else '') }}</div>
               </td>
-              <td><pre class="cmd">{{ check.method }}</pre></td>
-              <td><pre class="expected">{{ check.expected }}</pre></td>
-              <td><pre class="actual">{{ check.actual }}</pre></td>
+              <td><pre class="cmd">{{ check.method | default('') }}</pre></td>
+              <td><pre class="expected">{{ check.expected | default('') }}</pre></td>
+              <td><pre class="actual">{{ check.actual | default('') }}</pre></td>
               <td>
                 <span class="status {{ 'ok' if ok else 'fail' }}">{{ 'OK' if ok else 'Fail' }}</span>
               </td>

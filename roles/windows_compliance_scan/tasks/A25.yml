@@ -1,0 +1,29 @@
+---
+- name: A25 | auditpol /get /category:*
+  ansible.windows.win_shell: auditpol /get /category:*
+  register: a25
+
+- name: A25 | Simple evaluation (tune later)
+  set_fact:
+    a25_ok: >-
+      {{
+        a25.stdout is search('Credential Validation') and
+        a25.stdout is search('Success and Failure') and
+        a25.stdout is search('User Account Management') and
+        a25.stdout is search('Audit Policy Change')
+      }}
+    a25_status: "{{ 'OK' if a25_ok else 'Fail' }}"
+
+- name: A25 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'A25',
+          'method':'auditpol /get /category:*',
+          'expected': expected_text.A25,
+          'actual': a25.stdout,
+          'status': a25_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

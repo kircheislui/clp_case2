@@ -1,0 +1,261 @@
+# Report metadata
+report_title: "Windows OS Audit Report (Mock)"
+report_brand: "CLP Audit"
+report_timezone: "Asia/Hong_Kong"
+
+# Control list and display names
+os_controls:
+  - code: "A15"
+    name: "List of Windows Local Users and Adminstrator Group Members"
+  - code: "A20"
+    name: "OS level Password accoutn lockout configuration"
+  - code: "A21"
+    name: "OS Level Password Policy"
+  - code: "A25"
+    name: "OS Level Audit Configuration"
+  - code: "A26"
+    name: "OS Level audit logging policy"
+  - code: "A41"
+    name: "Users in Windows Administrator Group"
+  - code: "B7"
+    name: "OS Patch List"
+
+# Dummy data for multiple servers
+servers:
+  - name: "VSMPDB-SEAP05"
+    note: "SCCM baseline shows Compliant"
+    checks:
+      - control: "A15"
+        method: >
+          PowerShell:
+          Get-LocalUser; Get-LocalGroupMember -Group "Administrators"
+        expected: >
+          Local users enumerated; Administrators group contains only approved principals.
+        actual: |
+          Local Users:
+            - Name: Administrator, Enabled: False
+            - Name: svc_sql, Enabled: True
+            - Name: app_reader, Enabled: True
+          Administrators Group:
+            - CONTOSO\Domain Admins (Group)
+            - CONTOSO\WinOps_Admins (Group)
+            - CONTOSO\srv_build (User)
+        status: "OK"
+
+      - control: "A20"
+        method: >
+          net accounts
+        expected: >
+          Lockout threshold > 0; Lockout duration >= 15 minutes; Reset counter <= 15 minutes.
+        actual: |
+          Force user logoff: Never
+          Minimum password age (days): 1
+          Maximum password age (days): 90
+          Minimum password length: 14
+          Lockout threshold: 5
+          Lockout duration (minutes): 30
+          Lockout observation window (minutes): 15
+        status: "OK"
+
+      - control: "A21"
+        method: >
+          Domain: Get-ADDefaultDomainPasswordPolicy
+          Workgroup: secedit /export /cfg secpol.inf
+        expected: >
+          Complexity enabled; Min length >= 14; Max age <= 90 days; History >= 24; Lockout threshold > 0.
+        actual: |
+          Scope: Domain
+          ComplexityEnabled: True
+          MinPasswordLength: 14
+          PasswordHistoryCount: 24
+          MaxPasswordAgeDays: 90
+          MinPasswordAgeDays: 1
+          LockoutThreshold: 5
+          LockoutDurationMins: 30
+        status: "OK"
+
+      - control: "A25"
+        method: >
+          auditpol /get /category:* (Advanced Audit Policy)
+        expected: >
+          Required subcategories set to Success and Failure for Account Logon, Logon/Logoff, Policy Change,
+          Account Management, Privilege Use, Detailed Tracking (Process Creation), System.
+        actual: |
+          System Integrity: Success and Failure
+          Security State Change: Success and Failure
+          Logon: Success and Failure
+          Logoff: Success
+          Special Logon: Success
+          Audit Policy Change: Success and Failure
+          Authentication Policy Change: Success
+          User Account Management: Success and Failure
+          Computer Account Management: Success and Failure
+          Security Group Management: Success and Failure
+          Other Account Management Events: Success and Failure
+          Sensitive Privilege Use: Success and Failure
+          Process Creation: Success
+          Credential Validation: Success and Failure
+        status: "OK"
+
+      - control: "A26"
+        method: >
+          Get-LogProperties; Check Event Log max sizes and retention;
+          Wevtutil gl <LogName>
+        expected: >
+          Security log size >= 1GB; Retention mode set appropriately; Channels enabled per policy.
+        actual: |
+          Log: Security, MaxSize: 2048 MB, Retention: Overwrite events as needed
+          Log: System,   MaxSize: 1024 MB, Retention: Overwrite events as needed
+          Log: Application, MaxSize: 1024 MB, Retention: Overwrite events as needed
+        status: "OK"
+
+      - control: "A41"
+        method: >
+          Get-LocalGroupMember -Group "Administrators"
+        expected: >
+          Only approved groups/users present in local Administrators.
+        actual: |
+          Administrators:
+            - CONTOSO\Domain Admins
+            - CONTOSO\WinOps_Admins
+            - CONTOSO\srv_build
+        status: "OK"
+
+      - control: "B7"
+        method: >
+          Get-HotFix | Select HotFixID, Description, InstalledOn, InstalledBy
+        expected: >
+          Latest cumulative updates installed within policy SLA window.
+        actual: |
+          KB5032190 Cumulative Update  InstalledOn: 2024-12-15  InstalledBy: NT AUTHORITY\SYSTEM
+          KB5028166 Servicing Stack    InstalledOn: 2024-12-15  InstalledBy: NT AUTHORITY\SYSTEM
+        status: "OK"
+
+  - name: "VSMPWEB-EASP01"
+    note: "Mixed results for demo"
+    checks:
+      - control: "A15"
+        method: >
+          PowerShell:
+          Get-LocalUser; Get-LocalGroupMember -Group "Administrators"
+        expected: >
+          Local users enumerated; Administrators group contains only approved principals.
+        actual: |
+          Local Users:
+            - Name: Administrator, Enabled: True
+            - Name: webops, Enabled: True
+          Administrators Group:
+            - BUILTIN\Administrators
+            - CONTOSO\WebAdmins
+            - CONTOSO\webops
+        status: "Fail"   # local 'Administrator' enabled (example policy)
+
+      - control: "A20"
+        method: >
+          net accounts
+        expected: >
+          Lockout threshold > 0; Lockout duration >= 15 minutes; Reset counter <= 15 minutes.
+        actual: |
+          Lockout threshold: 0
+          Lockout duration (minutes): 0
+          Lockout observation window (minutes): 0
+        status: "Fail"
+
+      - control: "A21"
+        method: >
+          Domain: Get-ADDefaultDomainPasswordPolicy
+          Workgroup: secedit /export /cfg secpol.inf
+        expected: >
+          Complexity enabled; Min length >= 14; Max age <= 90 days; History >= 24; Lockout threshold > 0.
+        actual: |
+          Scope: Local
+          PasswordComplexity: 1
+          MinimumPasswordLength: 12
+          PasswordHistorySize: 12
+          MaximumPasswordAge: 180
+          MinimumPasswordAge: 0
+          LockoutBadCount: 0
+          LockoutDuration: 0
+        status: "Fail"
+
+      - control: "A25"
+        method: >
+          auditpol /get /category:*
+        expected: >
+          Required subcategories set appropriately.
+        actual: |
+          Logon: Success
+          Logoff: Success
+          Security Group Management: Success
+          Process Creation: (Not configured)
+        status: "Fail"
+
+      - control: "A26"
+        method: >
+          Get-LogProperties; Wevtutil gl <LogName>
+        expected: >
+          Security log size >= 1GB; Retention mode set appropriately.
+        actual: |
+          Log: Security, MaxSize: 256 MB, Retention: Overwrite events as needed
+        status: "Fail"
+
+      - control: "A41"
+        method: >
+          Get-LocalGroupMember -Group "Administrators"
+        expected: >
+          Only approved groups/users present in local Administrators.
+        actual: |
+          Administrators:
+            - BUILTIN\Administrators
+            - CONTOSO\WebAdmins
+            - CONTOSO\helpdesk_temp
+        status: "Fail"
+
+      - control: "B7"
+        method: >
+          Get-HotFix
+        expected: >
+          Latest cumulative updates installed within policy SLA window.
+        actual: |
+          KB5032190 Cumulative Update  InstalledOn: 2024-10-10  InstalledBy: NT AUTHORITY\SYSTEM
+          Note: Missing Dec 2024 cumulative (demo)
+        status: "Fail"
+
+  - name: "VDBCCS-EASP01"
+    note: "Auditpol based on your sample files"
+    checks:
+      - control: "A25"
+        method: >
+          auditpol /get /subcategory:"Security System Extension" etc.
+        expected: >
+          Required System/Logon/Account Mgmt/Policy Change/Privilege/Detailed Tracking set to Success and Failure per policy.
+        actual: |
+          Security System Extension: Success and Failure
+          System Integrity: Success and Failure
+          IPsec Driver: Success and Failure
+          Security State Change: Success and Failure
+          Logon: Success and Failure
+          Logoff: Success
+          Special Logon: Success
+          File System: Failure
+          Registry: Failure
+          Sensitive Privilege Use: Success and Failure
+          Process Creation: Success
+          Audit Policy Change: Success and Failure
+          Authentication Policy Change: Success
+          User Account Management: Success and Failure
+          Computer Account Management: Success and Failure
+          Security Group Management: Success and Failure
+          Other Account Management Events: Success and Failure
+          Credential Validation: Success and Failure
+        status: "OK"
+      - control: "A26"
+        method: >
+          Event log sizes and retention
+        expected: >
+          Security >= 1GB; System/Application >= 512MB.
+        actual: |
+          Security: 1024 MB
+          System: 512 MB
+          Application: 512 MB
+        status: "OK"

@@ -1,0 +1,31 @@
+---
+- name: B7 | Get-HotFix (latest 5)
+  ansible.windows.win_powershell:
+    script: |
+      Get-HotFix | Sort-Object -Property InstalledOn -Descending |
+      Select-Object -First 5 HotFixID, Description, InstalledOn |
+      ConvertTo-Json
+  register: b7
+
+- name: B7 | Build/Eval
+  set_fact:
+    b7_list: "{{ b7.stdout | from_json }}"
+    b7_actual: |-
+      {% for h in b7_list %}
+      {{ h.HotFixID }}  {{ h.Description }}  InstalledOn: {{ h.InstalledOn }}
+      {% endfor %}
+    b7_status: "OK"  # Keep neutral unless you add date math with culture-safe parsing
+
+- name: B7 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'B7',
+          'method':'Get-HotFix',
+          'expected': expected_text.B7,
+          'actual': b7_actual,
+          'status': b7_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

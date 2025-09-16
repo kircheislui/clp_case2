@@ -1,0 +1,65 @@
+---
+- name: A21 | Try domain policy, else local
+  ansible.windows.win_powershell:
+    script: |
+      try {
+        $p = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+        [PSCustomObject]@{
+          Scope='Domain'
+          ComplexityEnabled=$p.ComplexityEnabled
+          MinPasswordLength=$p.MinPasswordLength
+          MaxPasswordAgeDays=[int]$p.MaxPasswordAge.TotalDays
+          PasswordHistoryCount=$p.PasswordHistoryCount
+          LockoutThreshold=$p.LockoutThreshold
+          LockoutDurationMins=[int]$p.LockoutDuration.TotalMinutes
+        } | ConvertTo-Json -Compress
+      } catch {
+        secedit /export /cfg $env:TEMP\secpol.inf *> $null
+        $cfg = Get-Content $env:TEMP\secpol.inf
+        function Val($k){ ($cfg | Where-Object {$_ -match "^$k"}).Split('=')[-1].Trim() }
+        [PSCustomObject]@{
+          Scope='Local'
+          ComplexityEnabled=([int](Val 'PasswordComplexity') -eq 1)
+          MinPasswordLength=[int](Val 'MinimumPasswordLength')
+          MaxPasswordAgeDays=[int](Val 'MaximumPasswordAge')
+          PasswordHistoryCount=[int](Val 'PasswordHistorySize')
+          LockoutThreshold=[int](Val 'LockoutBadCount')
+          LockoutDurationMins=[int](Val 'LockoutDuration')
+        } | ConvertTo-Json -Compress
+      }
+  register: a21
+
+- name: A21 | Build/Eval
+  set_fact:
+    a21_obj: "{{ a21.stdout | from_json }}"
+    a21_actual: |-
+      Scope: {{ a21_obj.Scope }}
+      ComplexityEnabled: {{ a21_obj.ComplexityEnabled }}
+      MinPasswordLength: {{ a21_obj.MinPasswordLength }}
+      PasswordHistoryCount: {{ a21_obj.PasswordHistoryCount }}
+      MaxPasswordAgeDays: {{ a21_obj.MaxPasswordAgeDays }}
+      LockoutThreshold: {{ a21_obj.LockoutThreshold }}
+      LockoutDurationMins: {{ a21_obj.LockoutDurationMins }}
+    a21_status: >-
+      {{
+        (a21_obj.ComplexityEnabled and
+         (a21_obj.MinPasswordLength|int) >= policy.password.min_length and
+         (a21_obj.MaxPasswordAgeDays|int) <= policy.password.max_age_days and
+         (a21_obj.PasswordHistoryCount|int) >= policy.password.history and
+         (a21_obj.LockoutThreshold|int) >= policy.lockout.threshold_min)
+        | ternary('OK','Fail')
+      }}
+
+- name: A21 | Append
+  set_fact:
+    win_os_checks_struct: "{{ win_os_checks_struct | combine({
+      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
+        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
+          'control':'A21',
+          'method':'Get-ADDefaultDomainPasswordPolicy OR secedit /export /cfg',
+          'expected': expected_text.A21,
+          'actual': a21_actual,
+          'status': a21_status
+        } ])
+      }, recursive=True)
+    }, recursive=True) }}"

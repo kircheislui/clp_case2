@@ -1,12 +1,36 @@
 ---
-- name: Render Windows OS Audit Report from dummy data
-  hosts: all
-  become: true
+# Play 1: Collect from Windows
+- name: Windows OS compliance scan
+  hosts: windows
   gather_facts: false
-  vars_files:
-    - group_vars/all/vars.yml
-  vars:
-    out_dir: "/srv/awx/reports"
-    out_file: "{{ out_dir }}/windows_os_audit_report_mock.html"
   roles:
-    - win_audit
+    - role: windows_compliance_scan
+
+# Play 2: Render report on controller/AWX
+- name: Render Windows compliance report
+  hosts: localhost
+  gather_facts: false
+  vars:
+    report_title: "{{ report_title | default('Windows Security Compliance Report') }}"
+  tasks:
+    - name: Build host_results from hostvars
+      set_fact:
+        host_results: "{{ host_results | default({}) | combine({ item: hostvars[item]['win_os_checks_struct'][item] }, recursive=True) }}"
+      loop: "{{ groups['windows'] | default([]) }}"
+      when: hostvars[item].win_os_checks_struct is defined
+
+    - name: Render HTML report to string
+      set_fact:
+        report_html: "{{ lookup('template', 'templates/report.html.j2') }}"
+
+    - name: Persist report to exposed path on AWX host
+      when: artifact.to_path | default(false)
+      copy:
+        content: "{{ report_html }}"
+        dest: "{{ artifact.path }}/windows_os_audit_report_{{ '%Y%m%d_%H%M%S' | strftime }}.html"
+        mode: "0644"
+
+    - name: Emit to stdout (optional)
+      when: artifact.to_stdout | default(false)
+      debug:
+        msg: "{{ report_html | b64encode }}"
