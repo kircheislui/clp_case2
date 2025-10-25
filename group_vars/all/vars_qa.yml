@@ -1,0 +1,73 @@
+# RHEL-ITAUDIT-REPORT/group_vars/all/vars.yml
+# ===================================================================
+# GLOBAL CONFIGURATION
+# ===================================================================
+
+ansible_python_interpreter: /usr/bin/python3.9
+ansible_url: "https://aap-ctrl-qa.corp.clp.com.hk/"
+CLP_user_domain: DMNCLP
+
+# Set to true to enable credential retrieval from CyberArk.
+use_cyberark: true
+
+# Set to true to send email notifications, false to disable.
+send_email_notification: false
+
+# ===================================================================
+# CYBERARK CONFIGURATION
+# ===================================================================
+cyberark_url: "https://10.229.255.117"
+cyberark_app_id: "AnsibleQA"
+cyberark_safe: "WindowsDomain_ITAudit-T3"
+cyberark_folder: "Root"
+cyberark_platform_id: "POL_WindowsDomain_TypeIII"
+cyberark_object_name: "Operating System-{{cyberark_platform_id}}-corp.clp.com.hk-{{windows_ad_account}}"
+
+# ===================================================================
+# REPORTING & NOTIFICATION CONFIGURATION
+# ===================================================================
+# --- Email API (Boomi) Configuration ---
+apiUrl: "YOUR_BOOMI_API_URL"
+boomiToken: "YOUR_BOOMI_API_KEY"
+sgAPI: "Your_SG_API_Value"
+sgSecCode: "YOUR_SECRET_SG_CODE"
+### 
+###
+#https://clpgroup.sharepoint.com/sites/ITInfrastructure/Shared%20Documents/Forms/AllItems.aspx?id=%2Fsites%2FITInfrastructure%2FShared%20Documents%2FApplication%20Systems%2FProjects%2F2025%20%2D%20AAP%20Project%2FIT%20Audit%20Report%20Window%26Linux&viewid=dca68359%2D2511%2D4a57%2Da032%2D2d4dfd392285&ovuser=33893f4e%2D3397%2D4cab%2Dbb3c%2D9224bf7eafba%2Cgary%2Eg%2Eleung%40clp%2Ecom%2Ehk&OR=Teams%2DHL&CT=1757916143903&clickparams=eyJBcHBOYW1lIjoiVGVhbXMtRGVza3RvcCIsIkFwcFZlcnNpb24iOiI0OS8yNTA4MTUwMDcxNyIsIkhhc0ZlZGVyYXRlZFVzZXIiOmZhbHNlfQ%3D%3D
+# --- SharePoint Configuration (for MS Graph API) ---
+sharePointTenantName: "" # e.g., 'clp'
+sharePointTenantId: "" # Azure Tenant ID
+siteName: "ITInfrastructure" # e.g., 'IT-Automation'
+sharePointDriveName: "Documents" # The name of the Document Library
+sharePointFolderPath: "Application Systems/Projects/2025 - AAP Project/IT Audit Report Window&Linux" # e.g., 'SecurityCompliance/RHEL-Reports'
+
+# --- SharePoint Service Principal Credentials ---
+sharePointClientId: ""
+sharePointSecret: ""
+
+# --- Email and Report Details ---
+email_from_address: "aap-playbook-notification@mail.clp.com.hk"
+report_output_path: "/tmp"
+email_to_recipients:
+  - "raymond.ys.lui@clp.com.hk"
+
+# ===================================================================
+# COMPLIANCE CHECK VARIABLES (Customize as needed)
+# ===================================================================
+report_title: "{{ report_title | default('Windows Security Compliance Report') }}"
+
+
+# Optional control name map for the template (helps show friendly names)
+os_controls:
+  - { code: "A15", name: "List of Windows Local Users and Administrators Group" }
+  - { code: "A20", name: "Account Lockout Configuration" }
+  - { code: "A21", name: "Password Policy" }
+  - { code: "A25", name: "Advanced Audit Policy" }
+  - { code: "A26", name: "Event Log Size/Retention" }
+  - { code: "A41", name: "Local Administrators Membership" }
+  - { code: "B7",  name: "Installed Hotfixes" }
+
+# Service Account variables
+service_account: "DMNCLP\\Ansible_NP_Svc"
+windows_ad_account: "Ansible_NP_Svc"
+windows_domain: "DMNCLP"

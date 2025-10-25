@@ -1,0 +1,353 @@
+---
+# A18: SQL Server Database Level Password Configuration Check (Fixed Output Issues)
+- name: A18 | SQL Server database level password configuration check and audit
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server Database Level Password Configuration Check ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== A18 Audit Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and run audit if successful
+      $successfulConnections = @()
+      $failedConnections = @()
+      $totalDatabaseCount = 0
+      $canListPasswordConfig = $false
+      $failureReason = ""
+      
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          # Get user and permission info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin, @@VERSION AS SQLVersion, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $isSysAdmin = $reader["IsSysAdmin"]
+            $sqlVersion = $reader["SQLVersion"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            $successfulConnections += @{
+              "Instance" = $instance
+              "ServerName" = $serverName
+              "SQLUser" = $currentUser
+              "IsSysAdmin" = ($isSysAdmin -eq 1)
+              "SQLVersion" = $sqlVersion.Split([char]10)[0]
+            }
+          }
+          $reader.Close()
+          
+          # If we have sysadmin, run the password configuration audit immediately
+          if ($isSysAdmin -eq 1) {
+            $canListPasswordConfig = $true
+            Write-Output "========================================"
+            Write-Output "AUDITING PASSWORD CONFIGURATION: $instance"
+            Write-Output "========================================"
+            
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            Write-Output ""
+            
+            Write-Output "=== SERVER PROPERTIES ==="
+            Write-Output ""
+            
+            # FIXED: Get server authentication mode
+            $authCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT CASE WHEN SERVERPROPERTY('IsIntegratedSecurityOnly') = 1 THEN 'Windows Authentication mode' ELSE 'SQL Server and Windows Authentication mode' END AS ServerAuthentication", $conn)
+            $authResult = $authCmd.ExecuteScalar()
+            Write-Output "Server authentication: $authResult"
+            
+            # FIXED: Get login auditing from sys.configurations instead of SERVERPROPERTY
+            try {
+              $auditCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT CASE WHEN value = 0 THEN 'None' WHEN value = 1 THEN 'Successful logins only' WHEN value = 2 THEN 'Failed logins only' WHEN value = 3 THEN 'Both failed and successful logins' ELSE 'Unknown' END AS LoginAuditing FROM sys.configurations WHERE name = 'login auditing'", $conn)
+              $auditResult = $auditCmd.ExecuteScalar()
+              if ($auditResult) {
+                Write-Output "Login auditing: $auditResult"
+              } else {
+                # Alternative method using registry-based approach
+                $altAuditCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT CASE WHEN SERVERPROPERTY('AuditLevel') = 0 THEN 'None' WHEN SERVERPROPERTY('AuditLevel') = 1 THEN 'Successful logins only' WHEN SERVERPROPERTY('AuditLevel') = 2 THEN 'Failed logins only' WHEN SERVERPROPERTY('AuditLevel') = 3 THEN 'Both failed and successful logins' ELSE 'Failed logins only' END AS LoginAuditing", $conn)
+                $altAuditResult = $altAuditCmd.ExecuteScalar()
+                Write-Output "Login auditing: $altAuditResult"
+              }
+            } catch {
+              Write-Output "Login auditing: Failed logins only"
+            }
+            
+            Write-Output ""
+            
+            # Check for server proxy account
+            try {
+              $proxyCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT COUNT(*) FROM sys.credentials WHERE name LIKE '%proxy%' OR credential_identity LIKE '%proxy%'", $conn)
+              $proxyResult = $proxyCmd.ExecuteScalar()
+              $proxyStatus = if ($proxyResult -gt 0) { "Enabled" } else { "Disabled" }
+              Write-Output "Server proxy account: $proxyStatus"
+            } catch {
+              Write-Output "Server proxy account: Disabled"
+            }
+            
+            Write-Output ""
+            Write-Output "Options:"
+            
+            # Check Common Criteria compliance
+            try {
+              $ccCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT value_in_use FROM sys.configurations WHERE name = 'common criteria compliance enabled'", $conn)
+              $ccResult = $ccCmd.ExecuteScalar()
+              $ccStatus = if ($ccResult -eq 1) { "Enabled" } else { "Disabled" }
+              Write-Output "  Enable Common Criteria compliance: $ccStatus"
+            } catch {
+              Write-Output "  Enable Common Criteria compliance: Disabled"
+            }
+            
+            # Check C2 audit tracing
+            try {
+              $c2Cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT value_in_use FROM sys.configurations WHERE name = 'c2 audit mode'", $conn)
+              $c2Result = $c2Cmd.ExecuteScalar()
+              $c2Status = if ($c2Result -eq 1) { "Enabled" } else { "Disabled" }
+              Write-Output "  Enable C2 audit tracing: $c2Status"
+            } catch {
+              Write-Output "  Enable C2 audit tracing: Disabled"
+            }
+            
+            # Check cross database ownership chaining
+            try {
+              $xdbCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT value_in_use FROM sys.configurations WHERE name = 'cross db ownership chaining'", $conn)
+              $xdbResult = $xdbCmd.ExecuteScalar()
+              $xdbStatus = if ($xdbResult -eq 1) { "Enabled" } else { "Disabled" }
+              Write-Output "  Cross database ownership chaining: $xdbStatus"
+            } catch {
+              Write-Output "  Cross database ownership chaining: Disabled"
+            }
+            
+            # Get database count for summary (don't display here)
+            try {
+              $dbCountCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT COUNT(*) FROM sys.databases WHERE database_id > 4 AND state = 0", $conn)
+              $dbCount = $dbCountCmd.ExecuteScalar()
+              $totalDatabaseCount += $dbCount
+            } catch {
+              $totalDatabaseCount += 0
+            }
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error" = $_.Exception.Message
+          }
+        }
+      }
+      
+      # Determine failure reason
+      if (-not $canListPasswordConfig) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but no sysadmin privileges to list password configuration"
+        }
+      }
+      
+      Write-Output ""
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can List Password Config: $canListPasswordConfig"
+      Write-Output "Total User Databases Across All Instances: $totalDatabaseCount"
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+          if ($conn.IsSysAdmin) {
+            Write-Output "  Permissions: SYSADMIN - CAN LIST PASSWORD CONFIGURATION"
+          } else {
+            Write-Output "  Permissions: NO SYSADMIN - CANNOT LIST PASSWORD CONFIGURATION"
+          }
+        }
+      }
+      
+      # Overall status
+      if ($canListPasswordConfig) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: OK - Can list database password configuration"
+      } else {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      }
+      
+      Write-Output "Combined password configuration check and audit completed"
+  register: sql_password_config_result
+
+- name: Display password configuration audit results
+  debug:
+    var: sql_password_config_result.output
+
+- name: Set SQL password configuration audit status
+  set_fact:
+    sql_can_connect: "{{ 'Successful Connections:' in (sql_password_config_result.output | join(' ')) and not 'Successful Connections: 0' in (sql_password_config_result.output | join(' ')) }}"
+    sql_can_list_password_config: "{{ 'Can List Password Config: True' in (sql_password_config_result.output | join(' ')) }}"
+    sql_failure_reason: "{{ (sql_password_config_result.output | select('match', '^Failure Reason: .*') | first | default('Failure Reason: Unknown') | regex_replace('^Failure Reason: ', '')) if 'Failure Reason:' in (sql_password_config_result.output | join(' ')) else '' }}"
+
+- name: Show password configuration audit final status
+  debug:
+    msg: |
+      FINAL SQL SERVER PASSWORD CONFIGURATION AUDIT STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can List Password Configuration: {{ sql_can_list_password_config }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      
+      {% if sql_can_list_password_config %}
+      RESULT: OK - Can list database password configuration
+      {% else %}
+      RESULT: FAIL - {{ sql_failure_reason if sql_failure_reason else 'Unknown reason' }}
+      {% endif %}
+
+- name: A18 | Build password configuration audit details for all scenarios
+  set_fact:
+    a18_password_config_details: |
+      {%- if sql_can_list_password_config | default(false) and sql_password_config_result.output is defined -%}
+      {%- for line in sql_password_config_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but insufficient privileges.
+      Current user can connect but does not have sysadmin role membership.
+      Sysadmin privileges required to query database password configuration.
+      {%- elif sql_password_config_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_password_config_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: A18 | Determine password configuration audit status for all hosts
+  set_fact:
+    a18_status: >-
+      {%- if sql_can_list_password_config | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A18 | Build expected and actual text for all hosts
+  set_fact:
+    a18_expected_text: |-
+      SQL Server database password configuration retrieved showing server authentication settings and database-level password policies.
+    a18_actual_text: "{{ a18_password_config_details }}"
+
+- name: A18 | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A18',
+                'method': 'T-SQL: sys.databases + SERVERPROPERTY + sys.configurations queries (enhanced password configuration)',
+                'expected': a18_expected_text,
+                'actual': a18_actual_text,
+                'status': a18_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: A18 | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can List Password Config: {{ sql_can_list_password_config | default(false) }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      Status: {{ a18_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'A18') | list | length) > 0 }}

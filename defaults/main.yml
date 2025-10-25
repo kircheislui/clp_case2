@@ -1,21 +1,21 @@
 ---
 # Global policy defaults
-policy:
-  password:
-    min_length: 14
-    max_age_days: 90
-    history: 24
-    complexity: true
-  lockout:
-    threshold_min: 1
-    duration_min: 15
-    window_min: 15
-  logs:
-    security_min_mb: 1024
-    system_min_mb: 512
-    application_min_mb: 512
-  updates:
-    max_days_since_cu: 45
+#policy:
+#  password:
+#    min_length: 14
+#    max_age_days: 365
+#    history: 8
+#    complexity: true
+#  lockout:
+#    threshold_min: 5
+#    duration_min: 0
+#    window_min: 55
+#  logs:
+#    security_min_mb: 1024
+#    system_min_mb: 512
+#    application_min_mb: 512
+#  updates:
+#    max_days_since_cu: 45
 
 # Approved members that may appear in local Administrators group
 approved_admins:
@@ -36,3 +36,59 @@ expected_text:
 # Safety knobs for first client run
 safe_mode: true          # If parsing/permissions ambiguous, mark as Unknown (not Fail)
 assume_locale_en: true   # If outputs are not English, parsing may fail; we'll mark Unknown
+
+# Individual control variables for each check
+run_only_b7: false        # Run only B7 patch check
+run_only_a15: false       # Run only A15 local users check
+run_only_a20: false       # Run only A20 account lockout check
+run_only_a21: false       # Run only A21 password policy check
+run_only_a25: false       # Run only A25 audit configuration check
+run_only_a26: false       # Run only A26 audit logging policy check
+run_only_a41: false       # Run only A41 administrator group check
+run_only_a9_1: false      # Run only A9.1 SQL user list check
+run_only_a9_2: false      # Run only A9.2 SQL sysadmin check
+run_only_a18: false       # Run only A18 SQL password config check
+run_only_a19b: false      # Run only A19b SQL user password policy check
+run_only_a23: false       # Run only A23 SQL audit configuration check
+run_only_a24: false       # Run only A24 SQL audit logging policy check
+run_only_b8: false        # Run only B8 SQL patch list check
+
+# Group control variables (alternative approach)
+run_os_checks: true       # Run all OS-level checks
+run_sql_checks: true      # Run all SQL-level checks
+run_all_checks: true      # Run everything (default mode)
+
+# Windows OS Controls definitions
+win_os_controls:
+  - code: "INFO"
+    name: "System Information"
+  - code: "B7"
+    name: "OS Patch List"
+  - code: "B8"
+    name: "DB Patch List"
+  - code: "A9.1"
+    name: "SQL database user list"
+  - code: "A9.2"
+    name: "SQL database accounts with “sysadmin” role"
+  - code: "A18"
+    name: "DB level Password configuration"
+  - code: "A19b"
+    name: "Database Level password policy with each user setting"
+  - code: "A23"
+    name: "DB level Audit Configuration"
+  - code: "A24"
+    name: "Database Level audit logging policy"
+  - code: "A15"
+    name: "List of Windows Local Users and Administrator Group Members"
+  - code: "A20"
+    name: "OS level Password and account lockout configuration"
+  - code: "A21"
+    name: "OS Level password policy"
+  - code: "A25"
+    name: "OS level Audit Configuration"
+  - code: "A26"
+    name: "OS Level audit logging policy & Advanced Security Settings"
+  - code: "A41"
+    name: "Users in Windows Administrator Group"
+
+  

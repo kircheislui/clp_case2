@@ -1,0 +1,357 @@
+---
+# A19b: SQL Server Database Level Password Policy with Each User Setting (Streamlined Output)
+- name: A19b | SQL Server database level password policy with each user setting check and audit
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server Database Level Password Policy with Each User Setting ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== A19b Audit Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and run audit if successful
+      $successfulConnections = @()
+      $failedConnections = @()
+      $totalUserCount = 0
+      $usersWithPassword = 0
+      $usersWithPasswordPolicy = 0
+      $canListUserPasswordPolicy = $false
+      $failureReason = ""
+      $allPasswordPolicyCompliant = $true
+      
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          # Get user and permission info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin, @@VERSION AS SQLVersion, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $isSysAdmin = $reader["IsSysAdmin"]
+            $sqlVersion = $reader["SQLVersion"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            $successfulConnections += @{
+              "Instance" = $instance
+              "ServerName" = $serverName
+              "SQLUser" = $currentUser
+              "IsSysAdmin" = ($isSysAdmin -eq 1)
+              "SQLVersion" = $sqlVersion.Split([char]10)[0]
+            }
+          }
+          $reader.Close()
+          
+          # If we have sysadmin, run the user password policy audit immediately
+          if ($isSysAdmin -eq 1) {
+            $canListUserPasswordPolicy = $true
+            Write-Output "========================================"
+            Write-Output "AUDITING USER PASSWORD POLICY: $instance"
+            Write-Output "========================================"
+            
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            Write-Output ""
+            
+            # Get user password policy configuration using correct column names
+            $userPasswordPolicyQuery = "SELECT sp.name AS LoginName, sp.type_desc AS LoginType, sp.is_disabled AS IsDisabled, "
+            $userPasswordPolicyQuery += "sp.create_date AS CreateDate, sp.modify_date AS ModifyDate, "
+            $userPasswordPolicyQuery += "CASE WHEN sl.password_hash IS NOT NULL THEN 'YES' ELSE 'NO' END AS HasPassword, "
+            $userPasswordPolicyQuery += "CASE WHEN sl.is_policy_checked = 1 THEN 'YES' ELSE 'NO' END AS EnforcePasswordPolicy, "
+            $userPasswordPolicyQuery += "CASE WHEN sl.is_expiration_checked = 1 THEN 'YES' ELSE 'NO' END AS EnforcePasswordExpiration, "
+            $userPasswordPolicyQuery += "CASE WHEN sl.is_policy_checked = 1 AND sl.password_hash IS NOT NULL THEN 'COMPLIANT' ELSE 'NON_COMPLIANT' END AS PolicyStatus "
+            $userPasswordPolicyQuery += "FROM sys.server_principals sp "
+            $userPasswordPolicyQuery += "INNER JOIN sys.sql_logins sl ON sp.principal_id = sl.principal_id "
+            $userPasswordPolicyQuery += "WHERE sp.type = 'S' AND sp.name NOT LIKE '##%' "
+            $userPasswordPolicyQuery += "ORDER BY sp.name"
+            
+            $auditCmd = New-Object System.Data.SqlClient.SqlCommand($userPasswordPolicyQuery, $conn)
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($auditCmd)
+            $table = New-Object System.Data.DataTable
+            $adapter.Fill($table)
+            
+            Write-Output "Total SQL Server Logins Found: $($table.Rows.Count)"
+            $totalUserCount += $table.Rows.Count
+            Write-Output ""
+            Write-Output "LoginName`tLoginType`tDisabled`tHasPassword`tEnforcePasswordPolicy`tEnforcePasswordExpiration`tPolicyStatus"
+            Write-Output "----------------------------------------------------------------------------------------------------------------"
+            
+            $instanceUsersWithPassword = 0
+            $instanceUsersWithPasswordPolicy = 0
+            $instanceNonCompliantUsers = @()
+            
+            foreach ($row in $table.Rows) {
+              $loginName = $row["LoginName"]
+              $loginType = $row["LoginType"]
+              $disabled = $row["IsDisabled"]
+              $hasPassword = $row["HasPassword"]
+              $enforcePasswordPolicy = $row["EnforcePasswordPolicy"]
+              $enforcePasswordExpiration = $row["EnforcePasswordExpiration"]
+              $policyStatus = $row["PolicyStatus"]
+              
+              Write-Output "$loginName`t$loginType`t$disabled`t$hasPassword`t$enforcePasswordPolicy`t$enforcePasswordExpiration`t$policyStatus"
+              
+              # Count users with password
+              if ($hasPassword -eq "YES") {
+                $instanceUsersWithPassword++
+              }
+              
+              # Count users with password policy enforcement
+              if ($enforcePasswordPolicy -eq "YES") {
+                $instanceUsersWithPasswordPolicy++
+              }
+              
+              # Check compliance (both has password AND enforces password policy)
+              if ($policyStatus -eq "NON_COMPLIANT") {
+                $instanceNonCompliantUsers += $loginName
+                $allPasswordPolicyCompliant = $false
+              }
+            }
+            
+            $usersWithPassword += $instanceUsersWithPassword
+            $usersWithPasswordPolicy += $instanceUsersWithPasswordPolicy
+            
+            Write-Output ""
+            Write-Output "=== INSTANCE SUMMARY ==="
+            Write-Output "Users with Password: $instanceUsersWithPassword / $($table.Rows.Count)"
+            Write-Output "Users with Password Policy Enforcement: $instanceUsersWithPasswordPolicy / $($table.Rows.Count)"
+            Write-Output "Non-Compliant Users: $($instanceNonCompliantUsers.Count)"
+            
+            if ($instanceNonCompliantUsers.Count -gt 0) {
+              Write-Output "Non-Compliant User List: $($instanceNonCompliantUsers -join ', ')"
+            }
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error" = $_.Exception.Message
+          }
+        }
+      }
+      
+      # Determine failure reason and overall compliance
+      if (-not $canListUserPasswordPolicy) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but no sysadmin privileges to list user password policy"
+        }
+      } elseif (-not $allPasswordPolicyCompliant) {
+        $failureReason = "One or more users do not have both password and password policy enforcement"
+      }
+      
+      Write-Output ""
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can List User Password Policy: $canListUserPasswordPolicy"
+      Write-Output "Total SQL Server Logins Across All Instances: $totalUserCount"
+      Write-Output "Users with Password: $usersWithPassword"
+      Write-Output "Users with Password Policy Enforcement: $usersWithPasswordPolicy"
+      Write-Output "All Users Password Policy Compliant: $allPasswordPolicyCompliant"
+      if ($failureReason) {
+        Write-Output "Failure Reason: $failureReason"
+      }
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+          if ($conn.IsSysAdmin) {
+            Write-Output "  Permissions: SYSADMIN - CAN LIST USER PASSWORD POLICY"
+          } else {
+            Write-Output "  Permissions: NO SYSADMIN - CANNOT LIST USER PASSWORD POLICY"
+          }
+        }
+      }
+      
+      # Overall status
+      if ($canListUserPasswordPolicy -and $allPasswordPolicyCompliant) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: OK - Can list user password policy and all users are compliant"
+      } else {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      }
+      
+      Write-Output "Combined user password policy check and audit completed"
+  register: sql_user_password_policy_result
+
+- name: Display user password policy audit results
+  debug:
+    var: sql_user_password_policy_result.output
+
+- name: Set SQL user password policy audit status
+  set_fact:
+    sql_can_connect: "{{ 'Successful Connections:' in (sql_user_password_policy_result.output | join(' ')) and not 'Successful Connections: 0' in (sql_user_password_policy_result.output | join(' ')) }}"
+    sql_can_list_user_password_policy: "{{ 'Can List User Password Policy: True' in (sql_user_password_policy_result.output | join(' ')) }}"
+    sql_all_users_compliant: "{{ 'All Users Password Policy Compliant: True' in (sql_user_password_policy_result.output | join(' ')) }}"
+    sql_failure_reason: "{{ (sql_user_password_policy_result.output | select('match', '^Failure Reason: .*') | first | default('Failure Reason: Unknown') | regex_replace('^Failure Reason: ', '')) if 'Failure Reason:' in (sql_user_password_policy_result.output | join(' ')) else '' }}"
+
+- name: Show user password policy audit final status
+  debug:
+    msg: |
+      FINAL SQL SERVER USER PASSWORD POLICY AUDIT STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can List User Password Policy: {{ sql_can_list_user_password_policy }}
+      All Users Password Policy Compliant: {{ sql_all_users_compliant }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      
+      {% if sql_can_list_user_password_policy and sql_all_users_compliant %}
+      RESULT: OK - Can list user password policy and all users are compliant
+      {% else %}
+      RESULT: FAIL - {{ sql_failure_reason if sql_failure_reason else 'Unknown reason' }}
+      {% endif %}
+
+- name: A19b | Build user password policy audit details for all scenarios
+  set_fact:
+    a19b_user_password_policy_details: |
+      {%- if sql_can_list_user_password_policy | default(false) and sql_user_password_policy_result.output is defined -%}
+      {%- for line in sql_user_password_policy_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but insufficient privileges.
+      Current user can connect but does not have sysadmin role membership.
+      Sysadmin privileges required to query user password policy configuration.
+      {%- elif sql_user_password_policy_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_user_password_policy_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: A19b | Determine user password policy audit status for all hosts
+  set_fact:
+    a19b_status: >-
+      {%- if sql_can_list_user_password_policy | default(false) and sql_all_users_compliant | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A19b | Build expected and actual text for all hosts
+  set_fact:
+    a19b_expected_text: |-
+      All SQL Server logins have passwords and enforce password policy (HasPassword=YES, EnforcePasswordPolicy=YES).
+    a19b_actual_text: "{{ a19b_user_password_policy_details }}"
+
+- name: A19b | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A19b',
+                'method': 'T-SQL: sys.server_principals + sys.sql_logins query (user password policy)',
+                'expected': a19b_expected_text,
+                'actual': a19b_actual_text,
+                'status': a19b_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: A19b | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can List User Password Policy: {{ sql_can_list_user_password_policy | default(false) }}
+      All Users Password Policy Compliant: {{ sql_all_users_compliant | default(false) }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      Status: {{ a19b_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'A19b') | list | length) > 0 }}

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLP: Windows IT Audit Report for {{ reporting_group_name }}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .header h2 {
+            margin: 5px 0 0 0;
+            font-size: 18px;
+            font-weight: normal;
+        }
+        .info-section {
+            background-color: white;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .info-section strong {
+            color: #2c3e50;
+        }
+        .search-container {
+            background-color: white;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .search-box {
+            width: 100%;
+            max-width: 400px;
+            padding: 10px;
+            border: 2px solid #3498db;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        .search-box:focus {
+            outline: none;
+            border-color: #2980b9;
+        }
+        .server-section {
+            background-color: white;
+            margin-bottom: 30px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .server-header {
+            background-color: #34495e;
+            color: white;
+            padding: 15px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: white;
+        }
+        th {
+            background-color: #3498db;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+        }
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #ecf0f1;
+            vertical-align: top;
+        }
+        /* Row background colors based on status */
+        tr.row-ok {
+            background-color: #d5f4e6 !important;
+        }
+        tr.row-ok:hover {
+            background-color: #c8f2dd !important;
+        }
+        tr.row-partial {
+            background-color: #fef4e6 !important;
+        }
+        tr.row-partial:hover {
+            background-color: #fdefd6 !important;
+        }
+        tr.row-fail {
+            background-color: #fdeaea !important;
+        }
+        tr.row-fail:hover {
+            background-color: #fce0e0 !important;
+        }
+        /* Status column specific colors */
+        .status-ok {
+            background-color: #2ecc71 !important;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+        }
+        .status-partial {
+            background-color: #f39c12 !important;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+        }
+        .status-fail {
+            background-color: #e74c3c !important;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+        }
+        .control-column {
+            width: 80px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .item-column {
+            width: 200px;
+        }
+        .method-column {
+            width: 250px;
+        }
+        .expected-column {
+            width: 200px;
+        }
+        .actual-column {
+            width: 300px;
+        }
+        .status-column {
+            width: 80px;
+        }
+        .actual-text {
+            max-height: 150px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 11px;
+            background-color: #f8f9fa;
+            padding: 5px;
+            border-radius: 3px;
+        }
+        .no-results {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+            font-style: italic;
+        }
+        .unreachable-server {
+            text-align: center;
+            padding: 40px;
+            color: #e74c3c;
+            font-style: italic;
+            background-color: #fdeaea;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CLP: Windows IT Audit Report</h1>
+        <h2>{{ report_title }}</h2>
+    </div>
+
+    <div class="info-section">
+        <p><strong>Report Generated:</strong> {{ lookup('pipe', 'TZ="Asia/Hong_Kong" date "+%Y-%m-%d %H:%M:%S %Z"') }}</p>
+        <p><strong>Scan Target:</strong> {{ reporting_group_name }}</p>
+    </div>
+
+    <div class="search-container">
+        <input type="text" id="searchBox" class="search-box" placeholder="Search by Control, Item, Method, or Status..." onkeyup="filterTable()">
+    </div>
+
+    {% for host_name, data in host_results | dictsort %}
+    <div class="server-section" data-server="{{ host_name }}">
+        <div class="server-header">
+            Server: {{ host_name }}{% if data.note %} -- {{ data.note }}{% endif %}
+        </div>
+        
+        {% if data.checks and data.checks | length > 0 %}
+        <table>
+            <thead>
+                <tr>
+                    <th class="control-column">Control</th>
+                    <th class="item-column">Checking Item</th>
+                    <th class="method-column">Checking Command / Method</th>
+                    <th class="expected-column">Expected Result</th>
+                    <th class="actual-column">Actual Result</th>
+                    <th class="status-column">Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for check in data.checks %}
+                    {% set ok = (check.status | lower == 'ok') %}
+                    {% set partial = (check.status | lower == 'partial') %}
+                    {% if ok %}
+                        {% set rowClass = 'row-ok' %}
+                        {% set statusClass = 'status-ok' %}
+                        {% set statusText = 'OK' %}
+                    {% elif partial %}
+                        {% set rowClass = 'row-partial' %}
+                        {% set statusClass = 'status-partial' %}
+                        {% set statusText = 'Partial' %}
+                    {% else %}
+                        {% set rowClass = 'row-fail' %}
+                        {% set statusClass = 'status-fail' %}
+                        {% set statusText = 'Fail' %}
+                    {% endif %}
+                    {% set ctrl = os_controls | selectattr('code','equalto',check.control) | list | first %}
+                    {% set is_sql_check = (check.control == 'A9.1') %}
+                <tr class="data-row {{ rowClass }}">
+                    <td class="control-column">{{ check.control }}</td>
+                    <td class="item-column">
+                        {% if is_sql_check %}
+                            SQL Database User List
+                        {% else %}
+                            {{ (ctrl.name if ctrl is defined else '') }}
+                        {% endif %}
+                    </td>
+                    <td class="method-column">{{ check.method }}</td>
+                    <td class="expected-column">{{ check.expected }}</td>
+                    <td class="actual-column">
+                        <div class="actual-text">{{ check.actual | replace('\n', '<br>') | replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;') | safe }}</div>
+                    </td>
+                    <td class="status-column {{ statusClass }}">{{ statusText }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% elif data.unreachable is defined and data.unreachable %}
+        <div class="unreachable-server">
+            No Results (Host unreachable or scan failed)
+        </div>
+        {% else %}
+        <div class="no-results">
+            No compliance check results available for this server
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+
+    <script>
+        function filterTable() {
+            const searchTerm = document.getElementById('searchBox').value.toLowerCase();
+            const serverSections = document.getElementsByClassName('server-section');
+            
+            for (let section of serverSections) {
+                const rows = section.querySelectorAll('.data-row');
+                let visibleRows = 0;
+                
+                for (let row of rows) {
+                    const cells = row.getElementsByTagName('td');
+                    let rowText = '';
+                    
+                    for (let cell of cells) {
+                        rowText += cell.textContent.toLowerCase() + ' ';
+                    }
+                    
+                    if (rowText.includes(searchTerm)) {
+                        row.style.display = '';
+                        visibleRows++;
+                    } else {
+                        row.style.display = 'none';
+                    }
+                }
+                
+                if (visibleRows === 0 && searchTerm !== '') {
+                    section.style.display = 'none';
+                } else {
+                    section.style.display = 'block';
+                }
+            }
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+                e.preventDefault();
+                document.getElementById('searchBox').focus();
+            }
+        });
+    </script>
+</body>
+</html>

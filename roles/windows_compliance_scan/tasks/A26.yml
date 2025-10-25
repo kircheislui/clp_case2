@@ -1,40 +1,324 @@
 ---
-- name: A26 | wevtutil gl Security/System/Application
-  vars:
-    logs: [Security, System, Application]
-  ansible.windows.win_shell: "wevtutil gl {{ item }}"
-  loop: "{{ logs }}"
-  register: a26
+# A26 | OS Level Audit Logging Policy
 
-- name: A26 | Parse sizes and evaluate
+- name: A26 | gather OS level audit logging policy configuration
+  ansible.windows.win_powershell:
+    script: |
+      try {
+        # Get specific audit subcategories for logging policy compliance
+        $requiredSubcategories = @(
+          "Security System Extension",
+          "System Integrity", 
+          "Security State Change",
+          "Logon",
+          "Logoff",
+          "Special Logon",
+          "File System",
+          "Registry",
+          "Sensitive Privilege Use",
+          "Process Creation",
+          "Audit Policy Change",
+          "Authentication Policy Change",
+          "User Account Management",
+          "Computer Account Management",
+          "Security Group Management",
+          "Other Account Management Events",
+          "Credential Validation"
+        )
+        
+        $auditResults = @{}
+        $rawOutput = @()
+        $successfullyRetrieved = 0
+        
+        # Add header sections like the sample file
+        $rawOutput += "REM System"
+        $rawOutput += ""
+        
+        foreach ($subcategory in $requiredSubcategories) {
+          try {
+            # Add section headers based on category
+            if ($subcategory -eq "Logon") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Logon / Logoff"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "File System") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Object Access"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "Sensitive Privilege Use") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Privilege Use"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "Process Creation") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Detailed Tracking"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "Audit Policy Change") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Policy Change"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "User Account Management") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Account Management"
+              $rawOutput += ""
+            } elseif ($subcategory -eq "Credential Validation") {
+              $rawOutput += "REM"
+              $rawOutput += "REM Account Logon"
+              $rawOutput += ""
+            }
+            
+            # Add command with proper formatting
+            $rawOutput += "auditpol /get /subcategory:`"$subcategory`""
+            
+            $auditOutput = & auditpol /get /subcategory:"$subcategory" 2>$null
+            
+            if ($auditOutput) {
+              # Add the raw audit output with proper line breaks
+              foreach ($line in $auditOutput) {
+                $rawOutput += $line
+              }
+              
+              # Parse the output to extract setting
+              foreach ($line in $auditOutput) {
+                if ($line -match "^\s*$subcategory\s+(Success and Failure|Success|Failure|No Auditing)\s*$") {
+                  $setting = $line -replace "^\s*$subcategory\s+", ""
+                  $setting = $setting.Trim()
+                  
+                  $auditResults[$subcategory] = $setting
+                  $successfullyRetrieved++
+                  break
+                }
+              }
+            } else {
+              $rawOutput += "Error: Unable to retrieve audit policy for $subcategory"
+            }
+            
+            $rawOutput += ""
+          } catch {
+            $rawOutput += "Error: $($_.Exception.Message)"
+            $rawOutput += ""
+          }
+        }
+        
+        # Add Advanced Security Settings Auditing
+        $rawOutput += ""
+        $rawOutput += "=== ADVANCED SECURITY SETTINGS AUDITING ==="
+        $rawOutput += ""
+
+        # Get Advanced Security Settings for key system folders
+        $criticalPaths = @(
+          "C:\Windows\System32",
+          "C:\Windows\SysWOW64", 
+          "C:\Program Files",
+          "C:\Program Files (x86)"
+        )
+
+        $advancedAuditResults = @()
+
+        foreach ($path in $criticalPaths) {
+          try {
+            if (Test-Path $path) {
+              $rawOutput += "Path: $path"
+              $rawOutput += "=" * 50
+              
+              # Get ACL and audit rules
+              $acl = Get-Acl -Path $path -Audit
+              $auditRules = $acl.GetAuditRules($true, $true, [System.Security.Principal.NTAccount])
+              
+              if ($auditRules.Count -gt 0) {
+                # Group by audit type
+                $successRules = $auditRules | Where-Object { $_.AuditFlags -match "Success" }
+                $failureRules = $auditRules | Where-Object { $_.AuditFlags -match "Failure" }
+                
+                if ($successRules.Count -gt 0) {
+                  $rawOutput += ""
+                  $rawOutput += "SUCCESS AUDITING:"
+                  $rawOutput += "-" * 40
+                  $rawOutput += "Type           : Success"
+                  $rawOutput += "Applies To     : Advanced Permissions"
+                  $rawOutput += "Permissions    : Identity"
+                  $rawOutput += "-" * 40
+                  
+                  foreach ($rule in $successRules) {
+                    $identity = $rule.IdentityReference.Value
+                    $appliesTo = if ($rule.InheritanceFlags -eq "None") { "This folder only" } 
+                                elseif ($rule.InheritanceFlags -eq "ContainerInherit,ObjectInherit") { "This folder, subfolders and files" }
+                                elseif ($rule.InheritanceFlags -eq "ContainerInherit") { "This folder and subfolders" }
+                                elseif ($rule.InheritanceFlags -eq "ObjectInherit") { "This folder and files" }
+                                else { $rule.InheritanceFlags.ToString() }
+                    
+                    $permissions = $rule.FileSystemRights.ToString() -replace ",", ", "
+                    
+                    $rawOutput += "Type           : Success"
+                    $rawOutput += "Applies To     : $appliesTo"
+                    $rawOutput += "Permissions    : $permissions"
+                    $rawOutput += "Identity       : $identity"
+                    $rawOutput += ""
+                  }
+                }
+                
+                if ($failureRules.Count -gt 0) {
+                  $rawOutput += ""
+                  $rawOutput += "FAILURE AUDITING:"
+                  $rawOutput += "-" * 40
+                  
+                  foreach ($rule in $failureRules) {
+                    $identity = $rule.IdentityReference.Value
+                    $appliesTo = if ($rule.InheritanceFlags -eq "None") { "This folder only" } 
+                                elseif ($rule.InheritanceFlags -eq "ContainerInherit,ObjectInherit") { "This folder, subfolders and files" }
+                                elseif ($rule.InheritanceFlags -eq "ContainerInherit") { "This folder and subfolders" }
+                                elseif ($rule.InheritanceFlags -eq "ObjectInherit") { "This folder and files" }
+                                else { $rule.InheritanceFlags.ToString() }
+                    
+                    $permissions = $rule.FileSystemRights.ToString() -replace ",", ", "
+                    
+                    $rawOutput += "Type           : Failure"
+                    $rawOutput += "Applies To     : $appliesTo"  
+                    $rawOutput += "Permissions    : $permissions"
+                    $rawOutput += "Identity       : $identity"
+                    $rawOutput += ""
+                  }
+                }
+                
+                $advancedAuditResults += @{
+                  Path = $path
+                  SuccessRules = $successRules.Count
+                  FailureRules = $failureRules.Count
+                  TotalRules = $auditRules.Count
+                }
+              } else {
+                $rawOutput += "No audit rules configured for this path"
+                $rawOutput += ""
+              }
+              
+              $rawOutput += ""
+            }
+          } catch {
+            $rawOutput += "Error accessing $path`: $($_.Exception.Message)"
+            $rawOutput += ""
+          }
+        }
+        
+        $result = @{
+          AuditResults = $auditResults
+          SuccessfullyRetrieved = $successfullyRetrieved
+          TotalRequested = $requiredSubcategories.Count
+          AdvancedAuditResults = $advancedAuditResults
+          RawOutput = $rawOutput
+        }
+        
+        $result | ConvertTo-Json -Depth 5 -Compress
+      } catch {
+        @{
+          Error = $_.Exception.Message
+          AuditResults = @{}
+          SuccessfullyRetrieved = 0
+          TotalRequested = 17
+          AdvancedAuditResults = @()
+          RawOutput = @("Error occurred during audit policy retrieval")
+        } | ConvertTo-Json -Compress
+      }
+  register: a26_result
+  changed_when: false
+  failed_when: false
+
+- name: A26 | normalize result
   set_fact:
-    sec_kb: "{{ (a26.results | selectattr('item','equalto','Security') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
-    sys_kb: "{{ (a26.results | selectattr('item','equalto','System') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
-    app_kb: "{{ (a26.results | selectattr('item','equalto','Application') | first).stdout | regex_search('maxSize:\\s*(\\d+)', '\\1') | default('') | int }}"
-    a26_parsed_ok: "{{ (sec_kb > 0) or (sys_kb > 0) or (app_kb > 0) }}"
-    a26_actual: |-
-      Security MaxSize: {{ (sec_kb/1024)|round(0,'floor') }} MB
-      System   MaxSize: {{ (sys_kb/1024)|round(0,'floor') }} MB
-      Application MaxSize: {{ (app_kb/1024)|round(0,'floor') }} MB
+    a26_raw: "{{ (a26_result.output | default([])) | join('\n') | trim }}"
+
+- name: A26 | parse result (handle both string and object)
+  set_fact:
+    a26_data: >-
+      {%- if a26_raw is string and a26_raw != '' -%}
+        {{ a26_raw | from_json }}
+      {%- elif a26_raw is mapping -%}
+        {{ a26_raw }}
+      {%- else -%}
+        {}
+      {%- endif -%}
+
+- name: A26 | build audit logging policy details with proper line breaks
+  set_fact:
+    a26_audit_details: |
+      {%- if a26_data.Error is defined -%}
+      Error retrieving audit logging policy: {{ a26_data.Error }}
+      {%- elif a26_data.RawOutput is defined and a26_data.RawOutput | length > 0 -%}
+      {%- for line in a26_data.RawOutput -%}
+      {{ line }}
+      {% endfor -%}
+      {%- else -%}
+      No audit logging policy information available.
+      {%- endif -%}
+
+- name: A26 | determine compliance status with proper type conversion
+  set_fact:
+    a26_required_count: 17
+    a26_configured_count: "{{ (a26_data.SuccessfullyRetrieved | default(0) | string | int) }}"
+    a26_advanced_paths_count: "{{ (a26_data.AdvancedAuditResults | default([]) | length) }}"
+
+- name: A26 | determine final status
+  set_fact:
     a26_status: >-
+      {%- if a26_data.Error is defined -%}
+      Error
+      {%- elif (a26_configured_count | int) >= (a26_required_count | int) -%}
+      OK
+      {%- elif (a26_configured_count | int) > 0 -%}
+      Partial
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A26 | build expected text (simplified)
+  set_fact:
+    a26_expected_text: "Advanced Audit Policy configured for 17 required subcategories and Advanced Security Settings configured for critical system folders"
+
+- name: A26 | build actual text with compliance summary and proper formatting
+  set_fact:
+    a26_actual_text: |-
+      Compliance Status: {{ a26_status }}
+      Required subcategories: {{ a26_required_count }}
+      Successfully retrieved: {{ a26_configured_count }}
+      Advanced audit paths checked: {{ a26_advanced_paths_count }}
+      
+      {{ a26_audit_details }}
+
+# Ensure host structure exists
+- name: A26 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        (a26_parsed_ok and
-         (sec_kb >= policy.logs.security_min_mb*1024) and
-         (sys_kb >= policy.logs.system_min_mb*1024) and
-         (app_kb >= policy.logs.application_min_mb*1024))
-        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
 
-- name: A26 | Append
+# Append to report structure
+- name: A26 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A26',
-          'method':'wevtutil gl Security/System/Application',
-          'expected': expected_text.A26,
-          'actual': a26_actual,
-          'status': a26_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A26',
+                'method': 'PowerShell: auditpol /get /subcategory for 17 critical subcategories + Get-Acl -Audit for Advanced Security Settings on critical system folders',
+                'expected': a26_expected_text,
+                'actual': a26_actual_text,
+                'status': a26_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

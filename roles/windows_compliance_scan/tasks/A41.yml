@@ -1,44 +1,196 @@
 ---
-- name: A41 | Administrators membership
+# A41 | Users in Windows Administrator Group (Domain-only, simple OK/Fail)
+
+- name: A41 | gather domain group members only
   ansible.windows.win_powershell:
     script: |
       try {
-        Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name | ConvertTo-Json
-      } catch {
-        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
-      }
-  register: a41
+        # Groups to check in specified order
+        $groups = @(
+          "A_CLPP_GroupIT_PSM_DCO",
+          "A_CLPP_GroupIT_PSM_INFRA_APPL",
+          "Domain Admins",
+          "A_CLPP_GroupIT_PSM_Infra_ITMC_P",
+          "A_CLPP_GroupIT_PSM_Infra_Platform",
+          "A_CLPP_GroupIT_PSM_Infra_SysOps_p",
+          "A_SMP_Admin"
+        )
 
-- name: A41 | Build/Eval
+        function Parse-NetOutput {
+          param([string[]]$Lines)
+          $members = @()
+          $inSection = $false
+          foreach ($line in $Lines) {
+            if ($line -match "^-+$") { $inSection = $true; continue }
+            if ($inSection) {
+              if ($line -match "The command completed successfully") { break }
+              $t = $line.Trim()
+              if (-not [string]::IsNullOrWhiteSpace($t)) { $members += $t }
+            }
+          }
+          return ,$members
+        }
+
+        $groupResults = @{}
+        $rawOutput = New-Object System.Collections.ArrayList
+        $successCount = 0
+
+        foreach ($groupName in $groups) {
+          try {
+            # Raw header line
+            [void]$rawOutput.Add($groupName)
+            [void]$rawOutput.Add("")
+
+            # Domain query only (exact command)
+            $cmd = "net group `"$groupName`" /domain"
+            $out = & cmd.exe /c $cmd 2>&1
+            foreach ($l in $out) { [void]$rawOutput.Add($l) }
+            [void]$rawOutput.Add("")
+
+            $joined = ($out -join "`n")
+            $ok        = ($joined -match "The command completed successfully")
+
+            $members = @()
+            $status  = "Fail"   # default to Fail
+
+            if ($ok) {
+              $members = Parse-NetOutput -Lines $out
+              $status = "OK"
+              $successCount++
+            }
+
+            $groupResults[$groupName] = @{
+              "Members"     = $members
+              "MemberCount" = $members.Count
+              "Status"      = $status
+            }
+          } catch {
+            [void]$rawOutput.Add("Error: $($_.Exception.Message)")
+            [void]$rawOutput.Add("")
+            $groupResults[$groupName] = @{
+              "Members"     = @()
+              "MemberCount" = 0
+              "Status"      = "Fail"
+            }
+          }
+        }
+
+        $result = @{
+          GroupResults          = $groupResults
+          SuccessfullyRetrieved = $successCount
+          TotalRequested        = $groups.Count
+          RawOutput             = $rawOutput
+        }
+
+        $result | ConvertTo-Json -Depth 5 -Compress
+      } catch {
+        @{
+          Error                 = $_.Exception.Message
+          GroupResults          = @{}
+          SuccessfullyRetrieved = 0
+          TotalRequested        = 7
+          RawOutput             = @("Error occurred during domain group retrieval")
+        } | ConvertTo-Json -Compress
+      }
+  register: a41_result
+  changed_when: false
+  failed_when: false
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ CLP_user_domain }}\\{{ cyberark_pass.result.UserName }}"
+    ansible_become_password: "{{ cyberark_pass.result.Content }}"
+
+- name: A41 | normalize result
   set_fact:
-    a41_json: "{{ (a41.stdout | from_json) if (a41.stdout | default('') | regex_search('^[{\\[]')) else {'error': a41.stdout} }}"
-    a41_error: "{{ a41_json.error is defined }}"
-    a41_list: "{{ a41_json if (a41_json | type_debug) == 'list' else [] }}"
-    a41_actual: |-
-      {% if a41_error %}
-      Error: {{ a41_json.error }}
-      {% else %}
-      Administrators:
-      {% for m in a41_list %}
-        - {{ m }}
-      {% endfor %}
-      {% endif %}
+    a41_raw: "{{ (a41_result.output | default([])) | join('\n') | trim }}"
+
+- name: A41 | parse result
+  set_fact:
+    a41_data: >-
+      {%- if a41_raw is string and a41_raw != '' -%}
+        {{ a41_raw | from_json }}
+      {%- elif a41_raw is mapping -%}
+        {{ a41_raw }}
+      {%- else -%}
+        {}
+      {%- endif -%}
+
+- name: A41 | build domain group raw details
+  set_fact:
+    a41_group_details: |
+      {%- if a41_data.Error is defined -%}
+      Error retrieving domain groups: {{ a41_data.Error }}
+      {%- elif a41_data.RawOutput is defined and a41_data.RawOutput | length > 0 -%}
+      {%- for line in a41_data.RawOutput -%}
+      {{ line }}
+      {% endfor -%}
+      {%- else -%}
+      No domain group information available.
+      {%- endif -%}
+
+- name: A41 | determine final status (OK only if all listed groups succeeded)
+  set_fact:
     a41_status: >-
+      {%- if a41_data.Error is defined -%}
+      Fail
+      {%- elif a41_data.GroupResults is not defined or a41_data.GroupResults | length == 0 -%}
+      Fail
+      {%- else -%}
+        {%- set all_ok = true -%}
+        {%- for g, gd in a41_data.GroupResults.items() -%}
+          {%- if gd.Status | default('Fail') != 'OK' -%}
+            {%- set all_ok = false -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ 'OK' if all_ok else 'Fail' }}
+      {%- endif -%}
+
+- name: A41 | actual text (summary + raw)
+  set_fact:
+    a41_actual_text: |-
+      Compliance Status: {{ a41_status }}
+      Domain groups successfully listed: {{ a41_data.SuccessfullyRetrieved | default(0) }} / {{ a41_data.TotalRequested | default(0) }}
+      
+      {{ a41_group_details }}
+
+# Ensure host structure exists
+- name: A41 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        (not a41_error and (a41_list | difference(approved_admins) | length == 0))
-        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
 
-- name: A41 | Append
+# Append to report
+- name: A41 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A41',
-          'method':'PowerShell: Get-LocalGroupMember -Group "Administrators"',
-          'expected': expected_text.A41,
-          'actual': a41_actual,
-          'status': a41_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A41',
+                'method': 'PowerShell: net group /domain for administrator groups',
+                'checking_item': 'Users in Windows Administrator Group',
+                'expected': 'Domain group membership can be listed successfully.',
+                'actual': a41_actual_text,
+                'status': a41_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

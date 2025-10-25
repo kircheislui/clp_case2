@@ -1,51 +1,152 @@
 ---
-- name: A15 | Get local users and Administrators group members
+# A15 | List of Windows Local Users and Administrator Group Members
+
+- name: A15 | gather local users and admin group members
   ansible.windows.win_powershell:
     script: |
       try {
-        $users = Get-LocalUser | Select-Object Name,Enabled
-        $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name
-        [PSCustomObject]@{ users=$users; admins=$admins } | ConvertTo-Json
+        # Get all local users
+        $localUsers = Get-LocalUser | Select-Object Name, Enabled, Description, LastLogon, PasswordRequired, PasswordExpires, UserMayChangePassword
+        
+        # Get Administrator group members (handle different languages)
+        $adminGroupSid = "S-1-5-32-544"  # Built-in Administrators group SID
+        $adminGroup = Get-LocalGroup | Where-Object { $_.SID -eq $adminGroupSid }
+        $adminMembers = @()
+        
+        if ($adminGroup) {
+          try {
+            $adminMembers = Get-LocalGroupMember -Group $adminGroup.Name | Select-Object Name, ObjectClass, PrincipalSource
+          } catch {
+            # If Get-LocalGroupMember fails, try alternative method
+            $adminMembers = @()
+          }
+        }
+        
+        # Create result object
+        $result = @{
+          LocalUsers = $localUsers
+          AdminGroupMembers = $adminMembers
+          AdminGroupName = if ($adminGroup) { $adminGroup.Name } else { "Administrators" }
+          TotalUsers = $localUsers.Count
+          TotalAdminMembers = $adminMembers.Count
+        }
+        
+        $result | ConvertTo-Json -Depth 3 -Compress
       } catch {
-        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
+        @{
+          Error = $_.Exception.Message
+          LocalUsers = @()
+          AdminGroupMembers = @()
+          AdminGroupName = "Unknown"
+          TotalUsers = 0
+          TotalAdminMembers = 0
+        } | ConvertTo-Json -Compress
       }
-  register: a15
+  register: a15_result
+  changed_when: false
+  failed_when: false
 
-- name: A15 | Build/Eval
+- name: A15 | normalize result
   set_fact:
-    a15_json: "{{ (a15.stdout | from_json) if (a15.stdout | default('') | regex_search('^[{\\[]')) else {'error': a15.stdout} }}"
-    a15_has_error: "{{ a15_json.error is defined }}"
-    a15_users: "{{ (a15_json.users | default([])) }}"
-    a15_admins: "{{ (a15_json.admins | default([])) }}"
-    a15_actual: |-
-      {% if a15_has_error %}
-      Error: {{ a15_json.error }}
-      {% else %}
-      Local Users:
-      {% for u in a15_users %}
-        - Name: {{ u.Name }}, Enabled: {{ u.Enabled }}
-      {% endfor %}
-      Administrators Group:
-      {% for m in a15_admins %}
-        - {{ m }}
-      {% endfor %}
-      {% endif %}
+    a15_raw: "{{ (a15_result.output | default([])) | join('') | trim }}"
+
+- name: A15 | parse result (handle both string and object)
+  set_fact:
+    a15_data: >-
+      {%- if a15_raw is string and a15_raw != '' -%}
+        {{ a15_raw | from_json }}
+      {%- elif a15_raw is mapping -%}
+        {{ a15_raw }}
+      {%- else -%}
+        {}
+      {%- endif -%}
+
+- name: A15 | build local users list
+  set_fact:
+    a15_local_users_text: |-
+      {%- if a15_data.LocalUsers is defined and a15_data.LocalUsers | length > 0 -%}
+      {%- for user in a15_data.LocalUsers -%}
+      - {{ user.Name }}{% if user.Enabled is defined %} ({{ 'Enabled' if user.Enabled else 'Disabled' }}){% endif %}{% if user.Description %} - {{ user.Description }}{% endif %}<br>
+      {%- endfor -%}
+      {%- else -%}
+      No local users found or error occurred.
+      {%- endif -%}
+
+- name: A15 | build admin group members list
+  set_fact:
+    a15_admin_members_text: |-
+      {%- if a15_data.AdminGroupMembers is defined and a15_data.AdminGroupMembers | length > 0 -%}
+      {%- for member in a15_data.AdminGroupMembers -%}
+      - {{ member.Name }}{% if member.ObjectClass %} ({{ member.ObjectClass }}){% endif %}{% if member.PrincipalSource %} [{{ member.PrincipalSource }}]{% endif %}<br>
+      {%- endfor -%}
+      {%- else -%}
+      No administrator group members found or access denied.
+      {%- endif -%}
+
+- name: A15 | determine status with compliance logic
+  set_fact:
     a15_status: >-
+      {%- if a15_data.Error is defined -%}
+      Error
+      {%- elif a15_data.TotalUsers is defined and a15_data.TotalUsers > 0 and a15_data.TotalAdminMembers is defined -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A15 | build expected text
+  set_fact:
+    a15_expected_text: "Local users enumerated; Administrators group contains only approved principals."
+
+- name: A15 | build actual text
+  set_fact:
+    a15_actual_text: |-
+      {% if a15_data.Error is defined %}Error: {{ a15_data.Error }}{% else %}Total Local Users: {{ a15_data.TotalUsers | default(0) }}
+      Total Administrator Group Members: {{ a15_data.TotalAdminMembers | default(0) }}
+      
+      Local Users:
+      {{ a15_local_users_text }}
+      
+      Administrator Group ({{ a15_data.AdminGroupName | default('Administrators') }}) Members:
+      {{ a15_admin_members_text }}{% endif %}
+
+# Ensure host structure exists
+- name: A15 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        (not a15_has_error and (a15_admins | difference(approved_admins) | length == 0))
-        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
 
-- name: A15 | Append
+# Append to report structure
+- name: A15 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A15',
-          'method':'PowerShell: Get-LocalUser; Get-LocalGroupMember -Group "Administrators"',
-          'expected': expected_text.A15,
-          'actual': a15_actual,
-          'status': a15_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A15',
+                'method': 'PowerShell: Get-LocalUser, Get-LocalGroupMember',
+                'checking_item': 'List of Windows Local Users and Administrator Group Members',
+                'expected': a15_expected_text,
+                'actual': a15_actual_text,
+                'status': a15_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

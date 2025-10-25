@@ -1,0 +1,329 @@
+---
+# A9.2: SQL Server SysAdmin Role Members Check (Simplified, no PSM criteria)
+- name: A9.2 | SQL Server SysAdmin role members check and audit
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server SysAdmin Role Members Check ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== A9.2 Audit Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and run audit if successful
+      $successfulConnections = @()
+      $failedConnections = @()
+      $totalSysAdminCount = 0
+      $canListSysAdmins = $false
+      $failureReason = ""
+      
+      foreach ($instance in $allInstances) {
+        Write-Output "=== Testing connection to: $instance ==="
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          Write-Output "SUCCESS: Connected to $instance"
+          
+          # Get user and permission info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin, @@VERSION AS SQLVersion, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $isSysAdmin = $reader["IsSysAdmin"]
+            $sqlVersion = $reader["SQLVersion"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            Write-Output "SQL User: $currentUser"
+            Write-Output "Has SysAdmin: $($isSysAdmin -eq 1)"
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            
+            $successfulConnections += @{
+              "Instance"   = $instance
+              "ServerName" = $serverName
+              "SQLUser"    = $currentUser
+              "IsSysAdmin" = ($isSysAdmin -eq 1)
+              "SQLVersion" = $sqlVersion.Split([char]10)[0]
+            }
+          }
+          $reader.Close()
+          
+          # If we have sysadmin, run the sysadmin members audit immediately
+          if ($isSysAdmin -eq 1) {
+            $canListSysAdmins = $true
+            Write-Output ""
+            Write-Output "========================================"
+            Write-Output "AUDITING SYSADMIN MEMBERS: $instance"
+            Write-Output "========================================"
+            
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            Write-Output ""
+            
+            # Get sysadmin role members (no PSM filtering/flagging)
+            $sysadminQuery = '
+            SELECT
+            sp.name AS LoginName,
+            sp.type_desc AS LoginType,
+            sp.is_disabled AS IsDisabled,
+            sp.create_date AS CreateDate,
+            sp.default_database_name AS DefaultDatabase
+            FROM sys.server_principals sp
+            INNER JOIN sys.server_role_members srm
+            ON sp.principal_id = srm.member_principal_id
+            INNER JOIN sys.server_principals sr
+            ON srm.role_principal_id = sr.principal_id
+            WHERE sr.name = ''sysadmin'' AND sp.type IN (''S'', ''U'', ''G'')
+            ORDER BY sp.name
+            '
+            $auditCmd = New-Object System.Data.SqlClient.SqlCommand($sysadminQuery, $conn)
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($auditCmd)
+            $table = New-Object System.Data.DataTable
+            $adapter.Fill($table)
+            
+            Write-Output "Total SysAdmin Members Found: $($table.Rows.Count)"
+            $totalSysAdminCount += $table.Rows.Count
+            Write-Output ""
+            Write-Output "LoginName`tLoginType`tDisabled`tCreateDate`tDefaultDB"
+            Write-Output "----------------------------------------------------------------"
+            
+            foreach ($row in $table.Rows) {
+              $loginName = $row["LoginName"]
+              $loginType = $row["LoginType"]
+              $disabled = $row["IsDisabled"]
+              $createDate = $row["CreateDate"]
+              $defaultDb = $row["DefaultDatabase"]
+              
+              Write-Output "$loginName`t$loginType`t$disabled`t$createDate`t$defaultDb"
+            }
+            
+            Write-Output ""
+            Write-Output "Instance $instance sysadmin audit completed successfully"
+          } else {
+            Write-Output "WARNING: No sysadmin privileges - cannot list sysadmin members"
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          Write-Output "FAILED: $($_.Exception.Message)"
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error"    = $_.Exception.Message
+          }
+        }
+        Write-Output ""
+      }
+      
+      # Determine failure reason
+      if (-not $canListSysAdmins) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but no sysadmin privileges to list sysadmin members"
+        }
+      }
+      
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can List SysAdmins: $canListSysAdmins"
+      Write-Output "Total SysAdmin Members Across All Instances: $totalSysAdminCount"
+      if ($failureReason) {
+        Write-Output "Failure Reason: $failureReason"
+      }
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+          if ($conn.IsSysAdmin) {
+            Write-Output "  Permissions: SYSADMIN - CAN LIST SYSADMIN MEMBERS"
+          } else {
+            Write-Output "  Permissions: NO SYSADMIN - CANNOT LIST SYSADMIN MEMBERS"
+          }
+          Write-Output ""
+        }
+      }
+      
+      # Overall status based on ability to list sysadmin members only
+      if ($canListSysAdmins) {
+        Write-Output "OVERALL STATUS: OK - Can list sysadmin members"
+      } else {
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      }
+      
+      Write-Output "Combined sysadmin members check and audit completed"
+  register: sql_sysadmin_result
+
+- name: Display sysadmin audit results
+  debug:
+    var: sql_sysadmin_result.output
+
+- name: Set SQL sysadmin audit status
+  set_fact:
+    sql_can_connect: "{{ 'Successful Connections:' in (sql_sysadmin_result.output | join(' ')) and not 'Successful Connections: 0' in (sql_sysadmin_result.output | join(' ')) }}"
+    sql_can_list_sysadmins: "{{ 'Can List SysAdmins: True' in (sql_sysadmin_result.output | join(' ')) }}"
+    sql_failure_reason: "{{ (sql_sysadmin_result.output | select('match', '^Failure Reason: .*') | first | default('Failure Reason: Unknown') | regex_replace('^Failure Reason: ', '')) if 'Failure Reason:' in (sql_sysadmin_result.output | join(' ')) else '' }}"
+
+- name: Show sysadmin audit final status
+  debug:
+    msg: |
+      FINAL SQL SERVER SYSADMIN AUDIT STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can List SysAdmin Members: {{ sql_can_list_sysadmins }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      
+      {% if sql_can_list_sysadmins %}
+      RESULT: OK - Can list sysadmin members
+      {% else %}
+      RESULT: FAIL - {{ sql_failure_reason if sql_failure_reason else 'Unknown reason' }}
+      {% endif %}
+
+- name: A9.2 | Build sysadmin audit details for all scenarios
+  set_fact:
+    a9_2_sysadmin_details: |
+      {%- if sql_can_list_sysadmins | default(false) and sql_sysadmin_result.output is defined -%}
+      {%- for line in sql_sysadmin_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but insufficient privileges.
+      Current user can connect but does not have sysadmin role membership.
+      Sysadmin privileges required to query server role memberships.
+      {%- elif sql_sysadmin_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_sysadmin_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: A9.2 | Determine sysadmin audit status for all hosts
+  set_fact:
+    a9_2_status: >-
+      {%- if sql_can_list_sysadmins | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A9.2 | Build expected and actual text for all hosts
+  set_fact:
+    a9_2_expected_text: |-
+      SQL Server sysadmin role members retrieved from all instances.
+    a9_2_actual_text: "{{ a9_2_sysadmin_details }}"
+
+- name: A9.2 | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A9.2',
+                'method': 'T-SQL: sys.server_principals + sys.server_role_members query (sysadmin members)',
+                'expected': a9_2_expected_text,
+                'actual': a9_2_actual_text,
+                'status': a9_2_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: A9.2 | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can List SysAdmins: {{ sql_can_list_sysadmins | default(false) }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      Status: {{ a9_2_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'A9.2') | list | length) > 0 }}

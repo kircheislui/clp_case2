@@ -1,75 +1,179 @@
 ---
-- name: A21 | Try domain policy, else local
+# A21 | OS Level Password Policy
+
+- name: A21 | ensure temp dir
+  ansible.windows.win_tempfile:
+    state: directory
+  register: a21_temp_dir
+
+- name: A21 | export policy (merged)
+  ansible.windows.win_command:
+    cmd: secedit /export /cfg "{{ a21_temp_dir.path }}\\secpol.inf"
+  register: a21_secedit_result
+  failed_when: false
+
+- name: A21 | read secpol.inf (PowerShell Raw)
   ansible.windows.win_powershell:
     script: |
-      try {
-        $p = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
-        [PSCustomObject]@{
-          Scope='Domain'
-          ComplexityEnabled=$p.ComplexityEnabled
-          MinPasswordLength=$p.MinPasswordLength
-          MaxPasswordAgeDays=[int]$p.MaxPasswordAge.TotalDays
-          PasswordHistoryCount=$p.PasswordHistoryCount
-          LockoutThreshold=$p.LockoutThreshold
-          LockoutDurationMins=[int]$p.LockoutDuration.TotalMinutes
-        } | ConvertTo-Json -Compress
-      } catch {
-        try {
-          secedit /export /cfg $env:TEMP\secpol.inf *> $null
-          $cfg = Get-Content $env:TEMP\secpol.inf
-          function Val($k){ ($cfg | Where-Object {$_ -match "^$k"}).Split('=')[-1].Trim() }
-          [PSCustomObject]@{
-            Scope='Local'
-            ComplexityEnabled=([int](Val 'PasswordComplexity') -eq 1)
-            MinPasswordLength=[int](Val 'MinimumPasswordLength')
-            MaxPasswordAgeDays=[int](Val 'MaximumPasswordAge')
-            PasswordHistoryCount=[int](Val 'PasswordHistorySize')
-            LockoutThreshold=[int](Val 'LockoutBadCount')
-            LockoutDurationMins=[int](Val 'LockoutDuration')
-          } | ConvertTo-Json -Compress
-        } catch {
-          [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json -Compress
-        }
+      $path = "{{ a21_temp_dir.path }}\\secpol.inf"
+      if (Test-Path $path) {
+        Get-Content -Path $path -Raw
+      } else {
+        ""
       }
-  register: a21
+  register: a21_file_read
 
-- name: A21 | Build/Eval
+- name: A21 | normalize file content
   set_fact:
-    a21_obj: "{{ a21.stdout | from_json }}"
-    a21_error: "{{ a21_obj.error is defined }}"
-    a21_actual: |-
-      {% if a21_error %}
-      Error: {{ a21_obj.error }}
-      {% else %}
-      Scope: {{ a21_obj.Scope }}
-      ComplexityEnabled: {{ a21_obj.ComplexityEnabled }}
-      MinPasswordLength: {{ a21_obj.MinPasswordLength }}
-      PasswordHistoryCount: {{ a21_obj.PasswordHistoryCount }}
-      MaxPasswordAgeDays: {{ a21_obj.MaxPasswordAgeDays }}
-      LockoutThreshold: {{ a21_obj.LockoutThreshold }}
-      LockoutDurationMins: {{ a21_obj.LockoutDurationMins }}
-      {% endif %}
+    a21_inf_raw: "{{ (a21_file_read.output | default([])) | join('') }}"
+
+- name: A21 | define literals
+  set_fact:
+    a21_system_access_start: "[System Access]"
+
+- name: A21 | compute sa_start_idx
+  set_fact:
+    sa_start_idx: "{{ a21_inf_raw.find(a21_system_access_start) }}"
+
+- name: A21 | extract System Access block
+  set_fact:
+    system_access_block: >-
+      {%- if sa_start_idx | int >= 0 -%}
+        {%- set start_pos = sa_start_idx | int + a21_system_access_start | length -%}
+        {%- set content_after = a21_inf_raw[start_pos:] -%}
+        {%- set next_section = content_after.find('[') -%}
+        {%- if next_section >= 0 -%}
+          {{ content_after[:next_section] }}
+        {%- else -%}
+          {{ content_after }}
+        {%- endif -%}
+      {%- else -%}
+        
+      {%- endif -%}
+
+- name: A21 | map System Access k/v
+  set_fact:
+    sys_map: >-
+      {%- set lines = system_access_block.split('\n') -%}
+      {%- set result = {} -%}
+      {%- for line in lines -%}
+        {%- set clean_line = line.strip() -%}
+        {%- if clean_line and '=' in clean_line and not clean_line.startswith('#') -%}
+          {%- set key_val = clean_line.split('=', 1) -%}
+          {%- set key = key_val[0].strip() -%}
+          {%- set val = key_val[1].strip() -%}
+          {%- set _ = result.update({key: val}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result }}
+
+- name: A21 | expected attributes (all 6 password policy items)
+  set_fact:
+    a21_expected_attrs:
+      - PasswordHistorySize
+      - MaximumPasswordAge
+      - MinimumPasswordAge
+      - MinimumPasswordLength
+      - PasswordComplexity
+      - ClearTextPassword
+
+- name: A21 | presence and status
+  set_fact:
+    a21_present_keys: "{{ sys_map.keys() | list | intersect(a21_expected_attrs) }}"
+    a21_present_total: "{{ (sys_map.keys() | list | intersect(a21_expected_attrs)) | length }}"
+    a21_parsed_ok_total: "{{ (sys_map.keys() | list | intersect(a21_expected_attrs)) | length }}"
+
+- name: A21 | determine compliance values with proper type conversion (all 6 items)
+  set_fact:
+    a21_complexity: "{{ sys_map.get('PasswordComplexity', '0') | string }}"
+    a21_min_length: "{{ (sys_map.get('MinimumPasswordLength', '0') | string | int) }}"
+    a21_max_age: "{{ (sys_map.get('MaximumPasswordAge', '999') | string | int) }}"
+    a21_min_age: "{{ (sys_map.get('MinimumPasswordAge', '0') | string | int) }}"
+    a21_history: "{{ (sys_map.get('PasswordHistorySize', '0') | string | int) }}"
+    a21_reversible: "{{ sys_map.get('ClearTextPassword', '0') | string }}"
+
+- name: A21 | evaluate compliance (all 6 items)
+  set_fact:
+    a21_complexity_ok: "{{ a21_complexity == '1' }}"
+    a21_length_ok: "{{ (a21_min_length | int) >= 14 }}"
+    a21_max_age_ok: "{{ (a21_max_age | int) == 365 }}"
+    a21_min_age_ok: "{{ (a21_min_age | int) == 1 }}"
+    a21_history_ok: "{{ (a21_history | int) == 8 }}"
+    a21_reversible_ok: "{{ a21_reversible == '0' }}"
+
+- name: A21 | build password details (all 6 items in correct order)
+  set_fact:
+    a21_password_details: |-
+      - Minimum password age: {{ sys_map.get('MinimumPasswordAge', '0') }} days
+      - Maximum password age: {{ sys_map.get('MaximumPasswordAge', '0') }} days
+      - Minimum password length: {{ sys_map.get('MinimumPasswordLength', '0') }} characters
+      - Password must meet complexity requirements: {{ 'Enabled' if (sys_map.get('PasswordComplexity', '0') | string) == '1' else 'Disabled' }}
+      - Enforce password history: {{ sys_map.get('PasswordHistorySize', '0') }} passwords remembered
+      - Store passwords using reversible encryption: {{ 'Enabled' if (sys_map.get('ClearTextPassword', '0') | string) == '1' else 'Disabled' }}
+
+- name: A21 | determine final status (all 6 items)
+  set_fact:
     a21_status: >-
+      {%- if (a21_present_total | int) > 0 and a21_complexity_ok and a21_length_ok and a21_max_age_ok and a21_min_age_ok and a21_history_ok and a21_reversible_ok -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A21 | build expected text (all requirements)
+  set_fact:
+    a21_expected_text: "Complexity enabled; Min length == 14; Max age == 365 days; Min age == 1 day; History == 8; Reversible encryption disabled."
+
+- name: A21 | build actual text with compliance details (all 6 items)
+  set_fact:
+    a21_actual_text: |-
+      Compliance Status: {{ a21_status }}
+      - Complexity: {{ 'Enabled' if a21_complexity_ok else 'Disabled' }} ({{ 'OK' if a21_complexity_ok else 'FAIL - must be enabled' }})
+      - Min length: {{ a21_min_length }} chars ({{ 'OK' if a21_length_ok else 'FAIL - must be == 14' }})
+      - Max age: {{ a21_max_age }} days ({{ 'OK' if a21_max_age_ok else 'FAIL - must be == 365' }})
+      - Min age: {{ a21_min_age }} days ({{ 'OK' if a21_min_age_ok else 'FAIL - must be == 1' }})
+      - History: {{ a21_history }} passwords ({{ 'OK' if a21_history_ok else 'FAIL - must be == 8' }})
+      - Reversible encryption: {{ 'Disabled' if a21_reversible_ok else 'Enabled' }} ({{ 'OK' if a21_reversible_ok else 'FAIL - must be disabled' }})
+      
+      Detailed Settings:
+      {{ a21_password_details }}
+
+# Ensure host structure exists
+- name: A21 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        (not a21_error and
-         (a21_obj.ComplexityEnabled | bool) and
-         (a21_obj.MinPasswordLength | int) >= policy.password.min_length and
-         (a21_obj.MaxPasswordAgeDays | int) <= policy.password.max_age_days and
-         (a21_obj.PasswordHistoryCount | int) >= policy.password.history and
-         (a21_obj.LockoutThreshold | int) >= policy.lockout.threshold_min)
-        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
 
-- name: A21 | Append
+# Append to report structure
+- name: A21 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A21',
-          'method':'Get-ADDefaultDomainPasswordPolicy OR secedit /export /cfg',
-          'expected': expected_text.A21,
-          'actual': a21_actual,
-          'status': a21_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A21',
+                'method': 'secedit /export',
+                'expected': a21_expected_text,
+                'actual': a21_actual_text,
+                'status': a21_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

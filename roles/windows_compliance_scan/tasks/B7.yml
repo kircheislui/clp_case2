@@ -1,41 +1,216 @@
 ---
-- name: B7 | Get-HotFix (latest 5)
+# B7 | OS Patch List
+
+- name: B7 | gather installed Windows updates and patches
   ansible.windows.win_powershell:
     script: |
       try {
-        Get-HotFix | Sort-Object -Property InstalledOn -Descending |
-        Select-Object -First 5 HotFixID, Description, InstalledOn |
-        ConvertTo-Json
+        $rawOutput = @()
+        $patchResults = @{}
+        $successfullyRetrieved = 0
+        
+        # Add header
+        $rawOutput += "Installed Windows Updates and Patches"
+        $rawOutput += "=" * 50
+        $rawOutput += ""
+        
+        # Get installed updates using Get-HotFix and Win32_QuickFixEngineering
+        $rawOutput += "Getting installed hotfixes..."
+        $rawOutput += ""
+        
+        try {
+          $hotfixes = Get-HotFix | Sort-Object InstalledOn -Descending
+          
+          if ($hotfixes) {
+            $rawOutput += "HotFix ID`tDescription`tInstalled By`tInstalled On"
+            $rawOutput += "-" * 80
+            
+            foreach ($hotfix in $hotfixes) {
+              $installedOn = if ($hotfix.InstalledOn) { $hotfix.InstalledOn.ToString("M/d/yyyy") } else { "Unknown" }
+              $installedBy = if ($hotfix.InstalledBy) { $hotfix.InstalledBy } else { "System"  }
+              $description = if ($hotfix.Description) { $hotfix.Description } else { "Update" }
+              
+              $line = "$($hotfix.HotFixID)`t$description`t$installedBy`t$installedOn"
+              $rawOutput += $line
+            }
+            
+            $patchResults["HotFixes"] = @{
+              "Count" = $hotfixes.Count
+              "LatestDate" = if ($hotfixes[0].InstalledOn) { $hotfixes[0].InstalledOn.ToString("yyyy-MM-dd") } else { "Unknown" }
+            }
+            $successfullyRetrieved++
+          }
+        } catch {
+          $rawOutput += "Error retrieving hotfixes: $($_.Exception.Message)"
+        }
+        
+        $rawOutput += ""
+        $rawOutput += "Getting installed programs and updates..."
+        $rawOutput += ""
+        
+        # Get installed programs from registry (like Control Panel view)
+        try {
+          $uninstallKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          )
+          
+          $installedPrograms = @()
+          foreach ($key in $uninstallKeys) {
+            try {
+              $programs = Get-ItemProperty $key -ErrorAction SilentlyContinue | 
+                Where-Object { 
+                  $_.DisplayName -and 
+                  ($_.DisplayName -like "*Security Update*" -or 
+                   $_.DisplayName -like "*Microsoft Visual C++*" -or
+                   $_.DisplayName -like "*Microsoft Windows*" -or
+                   $_.DisplayName -like "*Update for Microsoft*") 
+                } |
+                Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+                Sort-Object InstallDate -Descending
+              
+              $installedPrograms += $programs
+            } catch {
+              # Continue if key doesn't exist
+            }
+          }
+          
+          if ($installedPrograms) {
+            $rawOutput += "Name`tVersion`tPublisher`tInstalled On"
+            $rawOutput += "-" * 100
+            
+            foreach ($program in $installedPrograms | Select-Object -First 50) {
+              $installDate = if ($program.InstallDate) { 
+                try {
+                  [datetime]::ParseExact($program.InstallDate, "yyyyMMdd", $null).ToString("M/d/yyyy")
+                } catch {
+                  $program.InstallDate
+                }
+              } else { "Unknown" }
+              
+              $version = if ($program.DisplayVersion) { $program.DisplayVersion } else { "" }
+              $publisher = if ($program.Publisher) { $program.Publisher } else { "" }
+              
+              $line = "$($program.DisplayName)`t$version`t$publisher`t$installDate"
+              $rawOutput += $line
+            }
+            
+            $patchResults["Programs"] = @{
+              "Count" = $installedPrograms.Count
+              "SecurityUpdatesCount" = ($installedPrograms | Where-Object { $_.DisplayName -like "*Security Update*" }).Count
+            }
+            $successfullyRetrieved++
+          }
+        } catch {
+          $rawOutput += "Error retrieving installed programs: $($_.Exception.Message)"
+        }
+        
+        $result = @{
+          PatchResults = $patchResults
+          SuccessfullyRetrieved = $successfullyRetrieved
+          TotalRequested = 2
+          RawOutput = $rawOutput
+        }
+        
+        $result | ConvertTo-Json -Depth 4 -Compress
       } catch {
-        [PSCustomObject]@{ error=$_.Exception.Message } | ConvertTo-Json
+        @{
+          Error = $_.Exception.Message
+          PatchResults = @{}
+          SuccessfullyRetrieved = 0
+          TotalRequested = 2
+          RawOutput = @("Error occurred during patch list retrieval")
+        } | ConvertTo-Json -Compress
       }
-  register: b7
+  register: b7_result
+  changed_when: false
+  failed_when: false
 
-- name: B7 | Build/Eval
+- name: B7 | normalize result
   set_fact:
-    b7_json: "{{ b7.stdout | from_json }}"
-    b7_error: "{{ b7_json.error is defined }}"
-    b7_list: "{{ b7_json if (b7_json | type_debug) == 'list' else [] }}"
-    b7_actual: |-
-      {% if b7_error %}
-      Error: {{ b7_json.error }}
-      {% else %}
-      {% for h in b7_list %}
-      {{ h.HotFixID }}  {{ h.Description }}  InstalledOn: {{ h.InstalledOn }}
-      {% endfor %}
-      {% endif %}
-    b7_status: "{{ 'OK' if not b7_error else ((safe_mode | bool) | ternary('Unknown','Fail')) }}"
+    b7_raw: "{{ (b7_result.output | default([])) | join('\n') | trim }}"
 
-- name: B7 | Append
+- name: B7 | parse result
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'B7',
-          'method':'Get-HotFix',
-          'expected': expected_text.B7,
-          'actual': b7_actual,
-          'status': b7_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    b7_data: >-
+      {%- if b7_raw is string and b7_raw != '' -%}
+        {{ b7_raw | from_json }}
+      {%- elif b7_raw is mapping -%}
+        {{ b7_raw }}
+      {%- else -%}
+        {}
+      {%- endif -%}
+
+- name: B7 | build OS patch list details
+  set_fact:
+    b7_patch_details: |
+      {%- if b7_data.Error is defined -%}
+      Error retrieving OS patch list: {{ b7_data.Error }}
+      {%- elif b7_data.RawOutput is defined and b7_data.RawOutput | length > 0 -%}
+      {%- for line in b7_data.RawOutput -%}
+      {{ line }}
+      {% endfor -%}
+      {%- else -%}
+      No OS patch information available.
+      {%- endif -%}
+
+- name: B7 | determine status
+  set_fact:
+    b7_status: >-
+      {%- if b7_data.Error is defined -%}
+      Error
+      {%- elif b7_data.PatchResults is defined and b7_data.SuccessfullyRetrieved > 0 -%}
+      OK
+      {%- else -%}
+      Unknown
+      {%- endif -%}
+
+- name: B7 | build expected text
+  set_fact:
+    b7_expected_text: |-
+      OS patch list successfully retrieved including Windows Updates, Security Updates, HotFixes with installation details.
+
+- name: B7 | build actual text
+  set_fact:
+    b7_actual_text: "{{ b7_patch_details }}"
+
+# Ensure host structure exists
+- name: B7 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+# Append to report structure
+- name: B7 | append row
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'B7',
+                'method': 'PowerShell: Get-HotFix and Registry Uninstall keys',
+                'checking_item': 'OS Patch List',
+                'expected': b7_expected_text,
+                'actual': b7_actual_text,
+                'status': b7_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

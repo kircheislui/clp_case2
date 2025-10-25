@@ -1,0 +1,301 @@
+---
+# B8: SQL Server Database Patch List Check
+- name: B8 | SQL Server database patch list check
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server Database Patch List Check ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== B8 Patch List Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and get patch information
+      $successfulConnections = @()
+      $failedConnections = @()
+      $canGetVersionInfo = $false
+      $failureReason = ""
+      $allVersionInfo = @()
+      
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          # Get basic connection info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            $successfulConnections += @{
+              "Instance" = $instance
+              "ServerName" = $serverName
+              "SQLUser" = $currentUser
+            }
+          }
+          $reader.Close()
+          
+          # Get SQL Server version information using @@VERSION
+          Write-Output "========================================"
+          Write-Output "SQL SERVER VERSION INFO: $instance"
+          Write-Output "========================================"
+          
+          Write-Output "Server Name: $serverName"
+          Write-Output "SQL User: $currentUser"
+          Write-Output ""
+          
+          try {
+            $versionCmd = New-Object System.Data.SqlClient.SqlCommand("SELECT @@VERSION AS SQLVersion", $conn)
+            $versionReader = $versionCmd.ExecuteReader()
+            
+            if ($versionReader.Read()) {
+              $sqlVersion = $versionReader["SQLVersion"].ToString()
+              $canGetVersionInfo = $true
+              
+              Write-Output "=== SQL SERVER PATCH INFORMATION ==="
+              Write-Output ""
+              Write-Output "Full Version String:"
+              Write-Output "$sqlVersion"
+              Write-Output ""
+              
+              # Parse version information
+              $versionLines = $sqlVersion -split "`n"
+              foreach ($line in $versionLines) {
+                if ($line.Trim() -ne "") {
+                  Write-Output "$line"
+                }
+              }
+              Write-Output ""
+              
+              $allVersionInfo += @{
+                "Instance" = $instance
+                "ServerName" = $serverName
+                "FullVersion" = $sqlVersion
+                "ParsedLines" = $versionLines
+              }
+            }
+            $versionReader.Close()
+            
+          } catch {
+            Write-Output "=== SQL SERVER PATCH INFORMATION ==="
+            Write-Output "Error retrieving version information: $($_.Exception.Message)"
+            Write-Output ""
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error" = $_.Exception.Message
+          }
+        }
+      }
+      
+      # Determine failure reason
+      if (-not $canGetVersionInfo) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but unable to retrieve version information"
+        }
+      }
+      
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can Get Version Info: $canGetVersionInfo"
+      Write-Output "Total Version Info Retrieved: $($allVersionInfo.Count)"
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+        }
+      }
+      
+      if ($failedConnections.Count -gt 0) {
+        Write-Output ""
+        Write-Output "=== FAILED CONNECTIONS ==="
+        foreach ($failed in $failedConnections) {
+          Write-Output "Instance: $($failed.Instance)"
+          Write-Output "  Error: $($failed.Error)"
+        }
+      }
+      
+      # Overall status
+      if ($canGetVersionInfo) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: OK - Successfully retrieved SQL Server version information"
+      } else {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      }
+      
+      Write-Output "SQL Server patch list check completed"
+  register: sql_patch_list_result
+
+- name: Display patch list results
+  debug:
+    var: sql_patch_list_result.output
+
+- name: Set SQL patch list status
+  set_fact:
+    sql_can_connect: "{{ 'Successful Connections:' in (sql_patch_list_result.output | join(' ')) and not 'Successful Connections: 0' in (sql_patch_list_result.output | join(' ')) }}"
+    sql_can_get_version: "{{ 'Can Get Version Info: True' in (sql_patch_list_result.output | join(' ')) }}"
+
+- name: Show patch list final status
+  debug:
+    msg: |
+      FINAL SQL SERVER PATCH LIST STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can Get Version Info: {{ sql_can_get_version }}
+      
+      {% if sql_can_get_version %}
+      RESULT: OK - Successfully retrieved SQL Server patch information
+      {% else %}
+      RESULT: FAIL - Cannot retrieve SQL Server version information
+      {% endif %}
+
+- name: B8 | Build patch list details
+  set_fact:
+    b8_patch_list_details: |
+      {%- if sql_can_get_version | default(false) and sql_patch_list_result.output is defined -%}
+      {%- for line in sql_patch_list_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but unable to retrieve version information.
+      {%- elif sql_patch_list_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_patch_list_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: B8 | Determine patch list status
+  set_fact:
+    b8_status: >-
+      {%- if sql_can_get_version | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: B8 | Build expected and actual text
+  set_fact:
+    b8_expected_text: |-
+      Status is OK when SQL Server version information can be retrieved using SELECT @@VERSION.
+      Status is FAIL when cannot connect to SQL Server or retrieve version information.
+    b8_actual_text: "{{ b8_patch_list_details }}"
+
+- name: B8 | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'B8',
+                'method': 'T-SQL: SELECT @@VERSION query (database patch list)',
+                'expected': b8_expected_text,
+                'actual': b8_actual_text,
+                'status': b8_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: B8 | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can Get Version Info: {{ sql_can_get_version | default(false) }}
+      Status: {{ b8_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'B8') | list | length) > 0 }}

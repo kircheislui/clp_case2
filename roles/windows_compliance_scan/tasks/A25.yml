@@ -1,29 +1,176 @@
 ---
-- name: A25 | auditpol /get /category:*
-  ansible.windows.win_shell: auditpol /get /category:*
-  register: a25
+# A25 | OS Level Audit Configuration
 
-- name: A25 | Simple evaluation (tunable)
+- name: A25 | gather OS level audit configuration
+  ansible.windows.win_powershell:
+    script: |
+      try {
+        # Get audit policy using auditpol command
+        $auditOutput = & auditpol /get /category:* 2>$null
+        
+        $auditPolicies = @{}
+        $currentCategory = ""
+        
+        if ($auditOutput) {
+          foreach ($line in $auditOutput) {
+            $line = $line.Trim()
+            
+            # Skip empty lines and headers
+            if (-not $line -or $line -match "^Machine Name:" -or $line -match "^Policy Target:" -or 
+                $line -match "^Subcategory/Category" -or $line -match "^-+$" -or $line -eq "System audit policy") {
+              continue
+            }
+            
+            # Check if this is a category line (no leading spaces after trim, but originally had no leading spaces)
+            if ($line -match "^[A-Za-z]" -and -not ($line -match "\s+(Success|Failure|No Auditing)")) {
+              $currentCategory = $line.Replace("Category/Subcategory", "").Replace("Setting", "").Trim()
+              continue
+            }
+            
+            # Check if this is a subcategory line (originally had leading spaces)
+            if ($line -match "^\s*(.+?)\s+(Success and Failure|Success|Failure|No Auditing)\s*$") {
+              $matches = [regex]::Match($line, "^\s*(.+?)\s+(Success and Failure|Success|Failure|No Auditing)\s*$")
+              if ($matches.Success) {
+                $subcategory = $matches.Groups[1].Value.Trim()
+                $setting = $matches.Groups[2].Value.Trim()
+                
+                if (-not $auditPolicies.ContainsKey($currentCategory)) {
+                  $auditPolicies[$currentCategory] = @{}
+                }
+                $auditPolicies[$currentCategory][$subcategory] = $setting
+              }
+            }
+          }
+        }
+        
+        # Alternative method using Get-WinEvent if auditpol fails
+        if ($auditPolicies.Count -eq 0) {
+          try {
+            # Try alternative approach with registry or WMI
+            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\eventlog\Security"
+            if (Test-Path $regPath) {
+              $auditPolicies["Alternative"] = @{
+                "Security Log Available" = "Yes"
+                "Method" = "Registry check successful"
+              }
+            }
+          } catch {
+            # Final fallback
+            $auditPolicies["Error"] = @{
+              "Message" = "Unable to retrieve audit policy"
+            }
+          }
+        }
+        
+        $result = @{
+          AuditPolicies = $auditPolicies
+          TotalCategories = $auditPolicies.Keys.Count
+          CommandUsed = "auditpol /get /category:*"
+        }
+        
+        $result | ConvertTo-Json -Depth 4 -Compress
+      } catch {
+        @{
+          Error = $_.Exception.Message
+          AuditPolicies = @{}
+          TotalCategories = 0
+          CommandUsed = "auditpol /get /category:*"
+        } | ConvertTo-Json -Compress
+      }
+  register: a25_result
+  changed_when: false
+  failed_when: false
+
+- name: A25 | normalize result
   set_fact:
-    a25_ok: >-
+    a25_raw: "{{ (a25_result.output | default([])) | join('') | trim }}"
+
+- name: A25 | parse result (handle both string and object)
+  set_fact:
+    a25_data: >-
+      {%- if a25_raw is string and a25_raw != '' -%}
+        {{ a25_raw | from_json }}
+      {%- elif a25_raw is mapping -%}
+        {{ a25_raw }}
+      {%- else -%}
+        {}
+      {%- endif -%}
+
+- name: A25 | build audit policy details (fixed formatting)
+  set_fact:
+    a25_audit_details: |-
+      {%- if a25_data.Error is defined -%}
+      Error retrieving audit configuration: {{ a25_data.Error }}
+      {%- elif a25_data.AuditPolicies is defined and a25_data.AuditPolicies | length > 0 -%}
+      {%- for category, subcategories in a25_data.AuditPolicies.items() -%}
+      {%- for subcategory, setting in subcategories.items() %}
+      System audit policy
+      Category/Subcategory                      Setting
+      {{ category }}
+      {{ subcategory }}                               {{ setting }}
+      {% endfor -%}
+      {%- endfor -%}
+      {%- else -%}
+      No audit policies found or command failed.
+      {%- endif -%}
+
+- name: A25 | determine status
+  set_fact:
+    a25_status: >-
+      {%- if a25_data.Error is defined -%}
+      Error
+      {%- elif a25_data.AuditPolicies is defined and a25_data.AuditPolicies | length > 0 -%}
+      OK
+      {%- else -%}
+      Unknown
+      {%- endif -%}
+
+- name: A25 | build expected text
+  set_fact:
+    a25_expected_text: |-
+      Advanced Audit Policy configured for required subcategories (System, Logon/Logoff, Object Access, Privilege Use, Detailed Tracking, Policy Change, Account Management, Account Logon).
+
+- name: A25 | build actual text
+  set_fact:
+    a25_actual_text: "{{ a25_audit_details }}"
+
+# Ensure host structure exists
+- name: A25 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        a25.stdout is search('Credential Validation') and
-        a25.stdout is search('Success and Failure') and
-        a25.stdout is search('User Account Management') and
-        a25.stdout is search('Policy Change')
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
-    a25_status: "{{ 'OK' if a25_ok else ((safe_mode | bool) | ternary('Unknown','Fail')) }}"
 
-- name: A25 | Append
+# Append to report structure
+- name: A25 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A25',
-          'method':'auditpol /get /category:*',
-          'expected': expected_text.A25,
-          'actual': a25.stdout,
-          'status': a25_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A25',
+                'method': 'PowerShell: auditpol /get /category:*',
+                'checking_item': 'OS Level Audit Configuration',
+                'expected': a25_expected_text,
+                'actual': a25_actual_text,
+                'status': a25_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

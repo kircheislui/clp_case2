@@ -1,0 +1,363 @@
+---
+# A24: SQL Server Database Level Audit Logging Policy Check
+- name: A24 | SQL Server database level audit logging policy check
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server Database Level Audit Logging Policy Check ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Define the required audit action names to validate
+      $requiredAuditActions = @(
+        "DATABASE_ROLE_MEMBER_CHANGE_GROUP",
+        "SERVER_ROLE_MEMBER_CHANGE_GROUP", 
+        "AUDIT_CHANGE_GROUP",
+        "DATABASE_PERMISSION_CHANGE_GROUP",
+        "SERVER_PERMISSION_CHANGE_GROUP",
+        "FAILED_LOGIN_GROUP",
+        "DATABASE_CHANGE_GROUP",
+        "DATABASE_OBJECT_CHANGE_GROUP",
+        "DATABASE_PRINCIPAL_CHANGE_GROUP",
+        "SERVER_PRINCIPAL_CHANGE_GROUP",
+        "SERVER_STATE_CHANGE_GROUP"
+      )
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== A24 Audit Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and validate audit action names
+      $successfulConnections = @()
+      $failedConnections = @()
+      $canCheckAuditActions = $false
+      $allRequiredNamesValid = $false
+      $failureReason = ""
+      $validActionCount = 0
+      $invalidActions = @()
+      
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          # Get user and permission info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin, @@VERSION AS SQLVersion, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $isSysAdmin = $reader["IsSysAdmin"]
+            $sqlVersion = $reader["SQLVersion"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            $successfulConnections += @{
+              "Instance" = $instance
+              "ServerName" = $serverName
+              "SQLUser" = $currentUser
+              "IsSysAdmin" = ($isSysAdmin -eq 1)
+              "SQLVersion" = $sqlVersion.Split([char]10)[0]
+            }
+          }
+          $reader.Close()
+          
+          # If we have sysadmin, validate audit action names
+          if ($isSysAdmin -eq 1) {
+            $canCheckAuditActions = $true
+            Write-Output "========================================"
+            Write-Output "CHECKING AUDIT ACTION VALIDITY: $instance"
+            Write-Output "========================================"
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            Write-Output ""
+            
+            Write-Output "=== VALIDATING REQUIRED ACTION NAMES ==="
+            Write-Output "Checking if all 11 required audit action names are valid in SQL Server..."
+            Write-Output ""
+            
+            $validCount = 0
+            $invalidCount = 0
+            
+            foreach ($action in $requiredAuditActions) {
+              $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT COUNT(*) FROM sys.dm_audit_actions WHERE name = '$action' AND class_desc = 'SERVER'", $conn)
+              $exists = $cmd.ExecuteScalar()
+              
+              if ($exists -gt 0) {
+                Write-Output "  ✓ $action - VALID"
+                $validCount++
+              } else {
+                Write-Output "  ✗ $action - INVALID (not found in sys.dm_audit_actions)"
+                $invalidCount++
+                $invalidActions += $action
+              }
+            }
+            
+            Write-Output ""
+            Write-Output "=== VALIDATION SUMMARY ==="
+            Write-Output "Total Required Actions: $($requiredAuditActions.Count)"
+            Write-Output "Valid Actions: $validCount"
+            Write-Output "Invalid Actions: $invalidCount"
+            Write-Output ""
+            
+            if ($invalidCount -eq 0) {
+              $allRequiredNamesValid = $true
+              $validActionCount = $validCount
+              Write-Output "=== COMPLIANCE CHECK ==="
+              Write-Output "PASS: All 11 required audit action names are valid in SQL Server"
+              Write-Output ""
+            } else {
+              Write-Output "=== COMPLIANCE CHECK ==="
+              Write-Output "FAIL: $invalidCount action name(s) are invalid"
+              Write-Output "Invalid actions:"
+              foreach ($invalid in $invalidActions) {
+                Write-Output "  - $invalid"
+              }
+              Write-Output ""
+            }
+            
+            # Optional: Show what's actually configured (informational only)
+            Write-Output "=== CURRENT CONFIGURATION (Informational) ==="
+            $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT COUNT(*) FROM sys.server_audit_specifications", $conn)
+            $specCount = $cmd.ExecuteScalar()
+            
+            $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT COUNT(DISTINCT audit_action_name) FROM sys.server_audit_specification_details", $conn)
+            $configuredActionCount = $cmd.ExecuteScalar()
+            
+            Write-Output "Server Audit Specifications: $specCount"
+            Write-Output "Configured Audit Actions: $configuredActionCount"
+            
+            if ($configuredActionCount -gt 0) {
+              Write-Output ""
+              Write-Output "Configured actions:"
+              $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT DISTINCT audit_action_name FROM sys.server_audit_specification_details ORDER BY audit_action_name", $conn)
+              $reader = $cmd.ExecuteReader()
+              while ($reader.Read()) {
+                $configuredAction = $reader[0]
+                $isRequired = if ($requiredAuditActions -contains $configuredAction) { "[REQUIRED]" } else { "[EXTRA]" }
+                Write-Output "  - $configuredAction $isRequired"
+              }
+              $reader.Close()
+            }
+            Write-Output ""
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error" = $_.Exception.Message
+          }
+        }
+      }
+      
+      # Determine failure reason
+      if (-not $canCheckAuditActions) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but no sysadmin privileges to check audit actions"
+        }
+      } elseif (-not $allRequiredNamesValid) {
+        $failureReason = "Not all required audit action names are valid in SQL Server"
+      }
+      
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can Check Audit Actions: $canCheckAuditActions"
+      Write-Output "All Required Names Valid: $allRequiredNamesValid"
+      Write-Output "Valid Action Names: $validActionCount"
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+          if ($conn.IsSysAdmin) {
+            Write-Output "  Permissions: SYSADMIN - CAN CHECK AUDIT ACTIONS"
+          } else {
+            Write-Output "  Permissions: NO SYSADMIN - CANNOT CHECK AUDIT ACTIONS"
+          }
+        }
+      }
+      
+      # Overall status
+      if (-not $canCheckAuditActions) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      } elseif ($allRequiredNamesValid) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: OK - All required audit action names are valid"
+      } else {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      }
+      
+      Write-Output "Database level audit logging policy check completed"
+  register: sql_audit_actions_result
+
+- name: Display audit actions results
+  debug:
+    var: sql_audit_actions_result.output
+
+- name: Set SQL audit actions status (CORRECTED)
+  set_fact:
+    sql_can_connect: "{{ sql_audit_actions_result.output | select('search', 'Successful Connections:') | list | length > 0 and sql_audit_actions_result.output | select('search', 'Successful Connections: 0') | list | length == 0 }}"
+    sql_can_list_audit_actions: "{{ sql_audit_actions_result.output | select('search', 'Can Check Audit Actions: True') | list | length > 0 }}"
+    sql_all_names_valid: "{{ sql_audit_actions_result.output | select('search', 'All Required Names Valid: True') | list | length > 0 }}"
+
+- name: Show audit actions final status
+  debug:
+    msg: |
+      FINAL SQL SERVER AUDIT ACTION NAMES VALIDATION STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can Check Audit Actions: {{ sql_can_list_audit_actions }}
+      All Required Names Valid: {{ sql_all_names_valid }}
+      
+      {% if sql_can_list_audit_actions and sql_all_names_valid %}
+      RESULT: PASS - All 11 required audit action names are valid
+      {% else %}
+      RESULT: FAIL - {% if not sql_can_list_audit_actions %}Cannot check audit actions{% else %}Some required action names are invalid{% endif %}
+      {% endif %}
+
+- name: A24 | Build audit actions details
+  set_fact:
+    a24_audit_actions_details: |
+      {%- if sql_can_list_audit_actions | default(false) and sql_audit_actions_result.output is defined -%}
+      {%- for line in sql_audit_actions_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but insufficient privileges.
+      Current user can connect but does not have sysadmin role membership.
+      Sysadmin privileges required to query audit action names.
+      {%- elif sql_audit_actions_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_audit_actions_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: A24 | Determine audit actions status (CORRECTED)
+  set_fact:
+    a24_status: >-
+      {%- if sql_can_list_audit_actions | default(false) and sql_all_names_valid | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A24 | Build expected and actual text
+  set_fact:
+    a24_expected_text: |-
+      Status is OK when all 11 required audit action names are valid in SQL Server.
+      Status is FAIL when any required action names are invalid or cannot access SQL Server.
+    a24_actual_text: "{{ a24_audit_actions_details }}"
+
+- name: A24 | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A24',
+                'item': 'Database level audit logging policy',
+                'method': 'T-SQL: sys.dm_audit_actions validation (check if 11 required audit action names exist)',
+                'expected': a24_expected_text,
+                'actual': a24_actual_text,
+                'status': a24_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: A24 | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can Check Audit Actions: {{ sql_can_list_audit_actions | default(false) }}
+      All Required Names Valid: {{ sql_all_names_valid | default(false) }}
+      Status: {{ a24_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'A24') | list | length) > 0 }}

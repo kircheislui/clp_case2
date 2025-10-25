@@ -2,7 +2,7 @@
 # Include policy/safety defaults
 - name: Load defaults
   include_vars:
-    file: "{{ playbook_dir }}/../defaults/main.yml"
+    file: "{{ playbook_dir }}/defaults/main.yml"
 
 # Preflight info to help interpret results
 - name: Preflight | gather basics
@@ -13,30 +13,319 @@
       $culture = (Get-Culture).Name
       [PSCustomObject]@{ IsAdmin=$isAdmin; PSVersion=$ver; Culture=$culture } | ConvertTo-Json -Compress
   register: preflight
+  failed_when: false
 
 - name: Initialize per-host results structure
   set_fact:
     win_os_checks_struct: "{{ { inventory_hostname: {'name': inventory_hostname, 'note': '', 'checks': [] } } }}"
 
-- name: Record preflight row
+# Robust parsing and fallback for preflight
+- name: Preflight | normalize raw output (stdout)
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'INFO',
-          'method':'PowerShell: Preflight (IsAdmin, PSVersion, Culture)',
-          'expected':'Admin recommended; PS 5.1+; Culture en-* for parsing',
-          'actual': ('IsAdmin: ' ~ ((preflight.stdout|from_json).IsAdmin|string) ~ '\nPSVersion: ' ~ (preflight.stdout|from_json).PSVersion ~ '\nCulture: ' ~ (preflight.stdout|from_json).Culture),
-          'status': (((preflight.stdout|from_json).IsAdmin) | ternary('OK','Unknown'))
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    preflight_raw: "{{ (preflight.stdout | default('') | trim) }}"
 
-# Controls
+- name: Preflight | normalize raw output (output[0] fallback)
+  set_fact:
+    preflight_raw: >-
+      {{
+        (preflight_raw | default('') | trim)
+        if (preflight_raw | default('') | trim) != ''
+        else (
+          ((preflight.output | default([])) | length > 0)
+          | ternary((preflight.output[0] | default('') | trim), '')
+        )
+      }}
+
+- name: Preflight | normalize raw output (host_out fallback)
+  set_fact:
+    preflight_raw: >-
+      {{
+        (preflight_raw | default('') | trim)
+        if (preflight_raw | default('') | trim) != ''
+        else (preflight.host_out | default('') | trim)
+      }}
+
+- name: Preflight | detect JSON or object
+  set_fact:
+    preflight_is_obj: "{{ preflight_raw is mapping or preflight_raw is sequence }}"
+    preflight_is_json: "{{ (preflight_raw | type_debug == 'str') and ((preflight_raw | default('')) is match('^\\s*[{\\[]')) }}"
+
+- name: Preflight | parse JSON (safe)
+  set_fact:
+    preflight_obj: >-
+      {{
+        preflight_raw
+        if preflight_is_obj
+        else
+          (
+            (preflight_raw | from_json)
+            if preflight_is_json
+            else {}
+          )
+      }}
+
+- name: Preflight | extract fields
+  set_fact:
+    preflight_is_admin: "{{ (preflight_obj.IsAdmin | default(false)) | bool }}"
+    preflight_psver: "{{ preflight_obj.PSVersion | default('') }}"
+    preflight_culture: "{{ preflight_obj.Culture | default('') }}"
+
+- name: Preflight | build display text
+  set_fact:
+    preflight_actual_text: |-
+      {% if preflight_is_obj or preflight_is_json %}
+      IsAdmin: {{ preflight_is_admin }}
+      PSVersion: {{ preflight_psver }}
+      Culture: {{ preflight_culture }}
+      {% else %}
+      Preflight output not JSON-parsable.
+      raw: {{ preflight_raw }}
+      {% endif %}
+    preflight_status: "{{ 'OK' if preflight_is_admin else 'Unknown' }}"
+
+# ================================================================================
+# CENTRALIZED MSSQL DETECTION LOGIC
+# ================================================================================
+
+- name: MSSQL Detection | Comprehensive SQL Server detection
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== Centralized MSSQL Detection ==="
+      
+      # Single instance discovery function
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only for testing
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Check for SQL Server services
+      $allSqlServices = @()
+      try {
+        $services = Get-Service -Name "MSSQL*" -ErrorAction SilentlyContinue
+        foreach ($service in $services) {
+          $allSqlServices += @{
+            Name = $service.Name
+            DisplayName = $service.DisplayName
+            Status = $service.Status.ToString()
+            StartType = $service.StartType.ToString()
+          }
+        }
+      } catch {}
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      
+      # Test connectivity to instances
+      $connectableInstances = @()
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          $conn.Close()
+          $connectableInstances += $instance
+        } catch {
+          # Cannot connect to this instance
+        }
+      }
+      
+      # Determine MSSQL detection status based on CONNECTIVITY
+      $mssqlDetected = ($connectableInstances.Count -gt 0)
+      
+      Write-Output "MSSQL Services Found: $($allSqlServices.Count)"
+      Write-Output "MSSQL Instances Found: $($allInstances.Count)"
+      Write-Output "Connectable Instances: $($connectableInstances.Count)"
+      Write-Output "MSSQL Detected: $mssqlDetected"
+      Write-Output "Detection Status: $(if ($mssqlDetected) { 'SQL_SERVER_DETECTED' } else { 'NO_SQL_SERVER' })"
+  register: mssql_detection_result
+
+- name: MSSQL Detection | Set global variables (based on connectivity)
+  set_fact:
+    mssql_services_count: "{{ (mssql_detection_result.output | select('match', '^MSSQL Services Found: .*') | first | default('MSSQL Services Found: 0') | regex_replace('^MSSQL Services Found: ', '')) | int }}"
+    mssql_connectable_count: "{{ (mssql_detection_result.output | select('match', '^Connectable Instances: .*') | first | default('Connectable Instances: 0') | regex_replace('^Connectable Instances: ', '')) | int }}"
+    mssql_detected: "{{ ((mssql_detection_result.output | select('match', '^Connectable Instances: .*') | first | default('Connectable Instances: 0') | regex_replace('^Connectable Instances: ', '')) | int) >= 1 }}"
+  when: mssql_detection_result is defined
+
+- name: MSSQL Detection | Set default variables when skipping detection
+  set_fact:
+    mssql_detected: false
+    mssql_services_count: 0
+    mssql_connectable_count: 0
+  when: mssql_detection_result is not defined
+
+- name: MSSQL Detection | Display detection results
+  debug:
+    msg: |
+      =================================================
+      MSSQL Detection Results for {{ inventory_hostname }}
+      =================================================
+      Services Found: {{ mssql_services_count }}
+      Connectable Instances: {{ mssql_connectable_count }}
+      MSSQL Detected: {{ mssql_detected }}
+      SQL Audit Tasks Will Run: {{ mssql_detected }}
+      =================================================
+
+# ================================================================================
+# OS LEVEL CONTROLS (Always Run)
+# ================================================================================
+
+- name: OS Audit | Starting OS level security checks
+  debug:
+    msg: "Running OS level security audit for {{ inventory_hostname }} (Always executed)"
+
+# OS Level Controls - Always run regardless of MSSQL detection
+
+# OS Level Controls with individual controls
 - include_tasks: A15.yml
+  when: run_only_a15 | default(false) | bool
+
 - include_tasks: A20.yml
+  when: run_only_a20 | default(false) | bool
+
 - include_tasks: A21.yml
+  when: run_only_a21 | default(false) | bool
+
 - include_tasks: A25.yml
+  when: run_only_a25 | default(false) | bool
+
 - include_tasks: A26.yml
+  when: run_only_a26 | default(false) | bool
+
 - include_tasks: A41.yml
+  when: run_only_a41 | default(false) | bool
+
 - include_tasks: B7.yml
+  when: run_only_b7 | default(false) | bool
+
+- name: OS Audit | OS level checks completed
+  debug:
+    msg: |
+      OS Level Audit Completed for {{ inventory_hostname }}:
+      - OS Checks: {{ win_os_checks_struct[inventory_hostname].checks | length }}
+
+# ================================================================================
+# SQL LEVEL CONTROLS (Only run if MSSQL connectable instances >= 1)
+# ================================================================================
+
+- name: SQL Audit | Starting SQL Server security checks
+  debug:
+    msg: "Running SQL Server security audit for {{ inventory_hostname }} ({{ mssql_connectable_count }} connectable instances)"
+  when: mssql_detected | bool
+
+- name: SQL Audit | Skipping SQL Server security checks
+  debug:
+    msg: "Skipping SQL Server security audit for {{ inventory_hostname }} - No connectable SQL Server instances found"
+  when: not (mssql_detected | bool)
+
+# SQL Level Controls with individual controls
+- include_tasks: A9_1.yml
+  when: 
+    - run_only_a9_1 | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: A9_2.yml
+  when: 
+    - run_only_a9_2 | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: A18.yml
+  when: 
+    - run_only_a18 | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: A19b.yml
+  when: 
+    - run_only_a19b | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: A23.yml
+  when: 
+    - run_only_a23 | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: A24.yml
+  when: 
+    - run_only_a24 | default(false) | bool
+    - mssql_detected | bool
+
+- include_tasks: B8.yml
+  when: 
+    - run_only_b8 | default(false) | bool
+    - mssql_detected | bool
+
+# ================================================================================
+# FINAL AUDIT SUMMARY
+# ================================================================================
+
+# Final Summary
+- name: Final Audit Summary
+  debug:
+    msg: |
+      =================================================
+      Windows Security Audit Summary for {{ inventory_hostname }}
+      =================================================
+      Mode: Full Security Audit
+      
+      MSSQL Detection:
+      - Services Found: {{ mssql_services_count }}
+      - Connectable Instances: {{ mssql_connectable_count }}
+      - SQL Audit Tasks Executed: {{ mssql_detected }}
+      
+      Total Checks: {{ win_os_checks_struct[inventory_hostname].checks | length }}
+      =================================================

@@ -1,35 +1,167 @@
 ---
-- name: A20 | net accounts
-  ansible.windows.win_shell: net accounts
-  register: netacc
+# A20 | Account Lockout Configuration
 
-- name: A20 | Parse/Eval
+- name: A20 | ensure temp dir
+  ansible.windows.win_tempfile:
+    state: directory
+  register: a20_temp_dir
+
+- name: A20 | export policy (merged)
+  ansible.windows.win_command:
+    cmd: secedit /export /cfg "{{ a20_temp_dir.path }}\\secpol.inf"
+  register: a20_secedit_result
+  failed_when: false
+
+- name: A20 | read secpol.inf (PowerShell Raw)
+  ansible.windows.win_powershell:
+    script: |
+      $path = "{{ a20_temp_dir.path }}\\secpol.inf"
+      if (Test-Path $path) {
+        Get-Content -Path $path -Raw
+      } else {
+        ""
+      }
+  register: a20_file_read
+
+- name: A20 | normalize file content
   set_fact:
-    a20_threshold: "{{ (netacc.stdout | regex_search('Lockout threshold:\\s*(\\d+)', '\\1') | default('')) | int }}"
-    a20_duration: "{{ (netacc.stdout | regex_search('Lockout duration.*:\\s*(\\d+)', '\\1') | default('')) | int }}"
-    a20_window:   "{{ (netacc.stdout | regex_search('Lockout observation window.*:\\s*(\\d+)', '\\1') | default('')) | int }}"
-    a20_parsed_ok: "{{ a20_threshold|string != '0' or a20_duration|string != '0' or a20_window|string != '0' }}"
+    a20_inf_raw: "{{ (a20_file_read.output | default([])) | join('') }}"
+
+- name: A20 | define literals
+  set_fact:
+    a20_system_access_start: "[System Access]"
+
+- name: A20 | compute sa_start_idx
+  set_fact:
+    sa_start_idx: "{{ a20_inf_raw.find(a20_system_access_start) }}"
+
+- name: A20 | extract System Access block (fixed approach)
+  set_fact:
+    system_access_block: >-
+      {%- if sa_start_idx | int >= 0 -%}
+        {%- set start_pos = sa_start_idx | int + a20_system_access_start | length -%}
+        {%- set content_after = a20_inf_raw[start_pos:] -%}
+        {%- set next_section = content_after.find('[') -%}
+        {%- if next_section >= 0 -%}
+          {{ content_after[:next_section] }}
+        {%- else -%}
+          {{ content_after }}
+        {%- endif -%}
+      {%- else -%}
+        
+      {%- endif -%}
+
+- name: A20 | map System Access k/v (simplified)
+  set_fact:
+    sys_map: >-
+      {%- set lines = system_access_block.split('\n') -%}
+      {%- set result = {} -%}
+      {%- for line in lines -%}
+        {%- set clean_line = line.strip() -%}
+        {%- if clean_line and '=' in clean_line and not clean_line.startswith('#') -%}
+          {%- set key_val = clean_line.split('=', 1) -%}
+          {%- set key = key_val[0].strip() -%}
+          {%- set val = key_val[1].strip() -%}
+          {%- set _ = result.update({key: val}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result }}
+
+- name: A20 | expected attributes (lockout only)
+  set_fact:
+    a20_expected_attrs:
+      - LockoutDuration
+      - LockoutBadCount
+      - ResetLockoutCount
+      - AllowAdministratorLockout
+
+- name: A20 | presence and status
+  set_fact:
+    a20_present_keys: "{{ sys_map.keys() | list | intersect(a20_expected_attrs) }}"
+    a20_present_total: "{{ (sys_map.keys() | list | intersect(a20_expected_attrs)) | length }}"
+    a20_parsed_ok_total: "{{ (sys_map.keys() | list | intersect(a20_expected_attrs)) | length }}"
+
+- name: A20 | determine compliance values with proper type conversion
+  set_fact:
+    a20_lockout_threshold: "{{ (sys_map.get('LockoutBadCount', '0') | string | int) }}"
+    a20_lockout_duration: "{{ (sys_map.get('LockoutDuration', '-1') | string | int) }}"
+    a20_reset_counter: "{{ (sys_map.get('ResetLockoutCount', '999') | string | int) }}"
+
+- name: A20 | evaluate compliance
+  set_fact:
+    a20_threshold_ok: "{{ (a20_lockout_threshold | int) == 5 }}"
+    a20_duration_ok: "{{ (a20_lockout_duration | int) <= 0 }}"
+    a20_reset_ok: "{{ (a20_reset_counter | int) == 55 }}"
+
+- name: A20 | build lockout details (fixed formatting)
+  set_fact:
+    a20_lockout_details: |-
+      - Account lockout duration: {{ sys_map.get('LockoutDuration', '0') }}
+      - Account lockout threshold: {{ sys_map.get('LockoutBadCount', '0') }} invalid logon attempts
+      - Allow Administrator account lockout: {{ 'Enabled' if (sys_map.get('AllowAdministratorLockout', '0') | string) == '1' else 'Disabled' }}
+      - Reset account lockout counter after: {{ sys_map.get('ResetLockoutCount', '0') }} minutes
+
+- name: A20 | determine final status
+  set_fact:
     a20_status: >-
+      {%- if (a20_present_total | int) > 0 and a20_threshold_ok and a20_duration_ok and a20_reset_ok -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A20 | build expected text (simplified)
+  set_fact:
+    a20_expected_text: "Lockout threshold == 5; Lockout duration == 0 minutes; Reset counter == 55 minutes."
+
+- name: A20 | build actual text with compliance details
+  set_fact:
+    a20_actual_text: |-
+      Compliance Status: {{ a20_status }}
+      - Lockout threshold: {{ a20_lockout_threshold }} ({{ 'OK' if a20_threshold_ok else 'FAIL - must be == 5' }})
+      - Lockout duration: {{ a20_lockout_duration }}{% if (a20_lockout_duration | int) <= 0 %} (indefinite){% else %} minutes{% endif %} ({{ 'OK' if a20_duration_ok else 'FAIL - must be == 0' }})
+      - Reset counter: {{ a20_reset_counter }} minutes ({{ 'OK' if a20_reset_ok else 'FAIL - must be == 55 min' }})
+      - Administrator lockout: {{ 'Enabled' if (sys_map.get('AllowAdministratorLockout', '0') | string) == '1' else 'Disabled' }} ({{ 'OK' if (sys_map.get('AllowAdministratorLockout', '0') | string) == '0' else 'REVIEW' }})
+      
+      Detailed Settings:
+      {{ a20_lockout_details }}
+
+# Ensure host structure exists
+- name: A20 | ensure host struct
+  set_fact:
+    win_os_checks_struct: >-
       {{
-        (
-          a20_parsed_ok and
-          a20_threshold >= policy.lockout.threshold_min and
-          a20_duration >= policy.lockout.duration_min and
-          a20_window   >= policy.lockout.window_min
-        )
-        | ternary('OK', (safe_mode | bool) | ternary('Unknown','Fail'))
+        (win_os_checks_struct | default({})) |
+        combine({
+          inventory_hostname: (
+            (win_os_checks_struct[inventory_hostname] | default({})) |
+            combine({
+              'name': inventory_hostname,
+              'note': (win_os_checks_struct[inventory_hostname].note | default('')),
+              'checks': (win_os_checks_struct[inventory_hostname].checks | default([]))
+            }, recursive=True)
+          )
+        }, recursive=True)
       }}
 
-- name: A20 | Append
+# Append to report structure
+- name: A20 | append row
   set_fact:
-    win_os_checks_struct: "{{ win_os_checks_struct | combine({
-      inventory_hostname: win_os_checks_struct[inventory_hostname] | combine({
-        'checks': (win_os_checks_struct[inventory_hostname].checks + [ {
-          'control':'A20',
-          'method':'net accounts',
-          'expected': expected_text.A20,
-          'actual': netacc.stdout,
-          'status': a20_status
-        } ])
-      }, recursive=True)
-    }, recursive=True) }}"
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A20',
+                'method': 'secedit /export',
+                'expected': a20_expected_text,
+                'actual': a20_actual_text,
+                'status': a20_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}

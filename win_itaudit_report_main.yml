@@ -1,37 +1,281 @@
----
-# Play 1: Collect from Windows
-- name: Windows OS compliance scan
+- name: Run WIN IT Audit and Generate Report
   hosts: "{{ target_hosts | default('auditWin') }}"
   gather_facts: false
+  vars_files:
+    - "{{ 'group_vars/all/vars_qa.yml' if (clp_env | default('')) == 'qa' else omit }}"
+    - "{{ 'group_vars/all/vars_prod.yml' if (clp_env | default('')) == 'prod' else omit }}"
+
+  # ===================================================================
+  # PRE-TASKS: OPTIONAL CYBERARK CREDENTIAL RETRIEVAL
+  # ===================================================================
+  pre_tasks:
+    - name: Fetch credentials from CyberArk when enabled
+      block:  
+        - name: Get Existing Password
+          cyberark.pas.cyberark_credential:
+            api_base_url: "{{ cyberark_url }}"
+            validate_certs: false
+            app_id: "{{ cyberark_app_id }}"
+            query: "Safe={{cyberark_safe}};Object={{ cyberark_object_name }}"
+            query_format: "Exact"
+            connection_timeout: 60
+          register: cyberark_pass
+          delegate_to: localhost
+          no_log: false 
+
+        - name: Set dynamic credentials for connection and privilege escalation
+          ansible.builtin.set_fact:
+            ansible_user: "{{ cyberark_pass.result.UserName }}"
+            ansible_password: "{{ cyberark_pass.result.Content }}"
+            cacheable: yes
+          no_log: false
+
+        - debug:
+            var: clp_env
+
+        - name: Test basic network connectivity (TCP port check)
+          wait_for:
+            host: "{{ inventory_hostname }}"
+            port: 5985
+            timeout: 10
+          delegate_to: localhost
+          ignore_errors: yes
+          register: port_check
+      when: use_cyberark | bool
   roles:
     - role: windows_compliance_scan
 
-# Play 2: Render report on controller/AWX
-- name: Render Windows compliance report
-  hosts: localhost
-  gather_facts: false
-  vars:
-    report_title: "{{ report_title | default('Windows Security Compliance Report') }}"
-    effective_group: "{{ target_hosts | default('auditWin') }}"
-  tasks:
-    - name: Build host_results from selected group
-      set_fact:
-        host_results: "{{ host_results | default({}) | combine({ item: hostvars[item]['win_os_checks_struct'][item] }, recursive=True) }}"
-      loop: "{{ groups[effective_group] | default([]) }}"
-      when: hostvars[item].win_os_checks_struct is defined
+# ===================================================================
+# POST-TASKS: GENERATE AND DISTRIBUTE REPORT (WINDOWS)
+# This block runs after all hosts have been processed by the roles.
+# It is delegated to localhost to perform the reporting tasks.
+# ===================================================================
+  post_tasks:
+    - name: "Generate and Distribute Windows Report"
+      delegate_to: localhost
+      run_once: true
+      block:
+        # --- 1. Collect host results from scanned group and define report vars ---
 
-    - name: Render HTML report to string
-      set_fact:
-        report_html: "{{ lookup('template', 'templates/report.html.j2') }}"
+        - name: Set reporting group name (Windows)
+          ansible.builtin.set_fact:
+            reporting_group_name: "{{ target_hosts | default('auditWin') }}"
 
-    - name: Persist report to exposed path on AWX host
-      when: artifact.to_path | default(false)
-      copy:
-        content: "{{ report_html }}"
-        dest: "{{ artifact.path }}/windows_os_audit_report_{{ '%Y%m%d_%H%M%S' | strftime }}.html"
-        mode: "0644"
+        - name: Resolve reporting hosts from group (including unreachable)
+          ansible.builtin.set_fact:
+            reporting_hosts: "{{ ansible_play_hosts_all | list }}"
 
-    - name: Emit to stdout (optional)
-      when: artifact.to_stdout | default(false)
-      debug:
-        msg: "{{ report_html | b64encode }}"
+        - name: Initialize host_results for all hosts (including unreachable)
+          ansible.builtin.set_fact:
+            host_results: {}
+
+        - name: Collect results from reachable hosts
+          ansible.builtin.set_fact:
+            host_results: >-
+              {{
+                host_results |
+                combine({
+                  item: hostvars[item].win_os_checks_struct[item]
+                })
+              }}
+          loop: "{{ reporting_hosts }}"
+          when:
+            - hostvars[item] is defined
+            - hostvars[item].win_os_checks_struct is defined
+            - hostvars[item].win_os_checks_struct[item] is defined
+
+        - name: Add unreachable hosts to results
+          ansible.builtin.set_fact:
+            host_results: >-
+              {{
+                host_results |
+                combine({
+                  item: {
+                    'checks': [],
+                    'unreachable': true,
+                    'note': 'Host unreachable or scan failed'
+                  }
+                })
+              }}
+          loop: "{{ reporting_hosts }}"
+          when:
+            - item not in ansible_play_hosts_all or
+              hostvars[item] is not defined or
+              hostvars[item].win_os_checks_struct is not defined or
+              hostvars[item].win_os_checks_struct[item] is not defined
+
+        - name: Set report title (Windows)
+          ansible.builtin.set_fact:
+            report_title: "{{ (win_report_title | default('Windows Security Compliance Report')) | string }}"
+
+        - name: Set report timestamp (Windows)
+          ansible.builtin.set_fact:
+            report_timestamp: "{{ lookup('pipe', \"TZ='Asia/Hong_Kong' date +'%Y%m%d_%H%M%S'\") }}"
+
+        - name: Build report filename (Windows)
+          ansible.builtin.set_fact:
+            report_filename: "win_itaudit_report_{{ reporting_group_name }}_{{ report_timestamp }}.html"
+
+        - name: Build report full path (Windows)
+          ansible.builtin.set_fact:
+            report_full_path: "{{ report_output_path }}/{{ report_filename }}"
+
+        - name: Build report subject (Windows)
+          ansible.builtin.set_fact:
+            report_subject: "Windows IT Audit Report for [{{ reporting_group_name }}] - Success"
+
+        # --- 2. Generate HTML report ---
+        - name: Generate HTML report from template (Windows)
+          ansible.builtin.template:
+            src: templates/win_report_template.html.j2
+            dest: "{{ report_full_path }}"
+          vars:
+            template_title: "{{ report_title }}"
+            template_group: "{{ reporting_group_name }}"
+            template_hosts: "{{ reporting_hosts }}"
+            template_host_results: "{{ host_results }}"
+            template_generated_at_hk: "{{ report_timestamp }}"
+            os_controls: "{{ win_os_controls | default([]) }}"
+
+        # --- 3. Authenticate and Upload to SharePoint ---
+        - name: Get access token from Microsoft Identity Platform
+          ansible.builtin.uri:
+            url: "https://login.microsoftonline.com/{{ sharePointTenantId }}/oauth2/v2.0/token"
+            method: POST
+            body:
+              client_id: "{{ sharePointClientId }}"
+              scope: "https://graph.microsoft.com/.default"
+              client_secret: "{{ sharePointSecret }}"
+              grant_type: "client_credentials"
+            body_format: form-urlencoded
+            return_content: yes
+          register: authResponse
+
+        - name: Get SharePoint site ID
+          ansible.builtin.uri:
+            url: "https://graph.microsoft.com/v1.0/sites/{{ sharePointTenantName }}.sharepoint.com:/sites/{{ siteName }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ authResponse.json.access_token }}"
+            return_content: yes
+          register: siteInfo
+
+        - name: Get SharePoint Drives ID
+          ansible.builtin.uri:
+            url: "https://graph.microsoft.com/v1.0/sites/{{ siteInfo.json.id }}/drives"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ authResponse.json.access_token }}"
+          register: drivesInfo
+
+        - name: "Set Drive ID for desired drive {{ sharePointDriveName }}"
+          ansible.builtin.set_fact:
+            driveId: "{{ drive.id }}"
+          loop: "{{ drivesInfo.json.value | default([]) }}"
+          loop_control:
+            loop_var: drive
+          when: drive.name == sharePointDriveName
+
+        - name: Upload file to SharePoint
+          ansible.builtin.uri:
+            url: "https://graph.microsoft.com/v1.0/drives/{{ driveId | urlencode }}/root:/{{ sharePointFolderPath | urlencode }}/{{ report_filename | urlencode }}:/content"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ authResponse.json.access_token }}"
+              Content-Type: "text/html"
+            body: "{{ lookup('file', report_full_path ) }}"
+            status_code: [200, 201]
+          register: uploadResult
+          when: driveId is defined and driveId != ""
+
+        - name: Debug upload response keys
+          ansible.builtin.debug:
+            var: uploadResult.json
+
+        # --- 4. Send SUCCESS Notification via API (Windows, link only) ---
+        - name: Set execution start time (UTC)
+          ansible.builtin.set_fact:
+            exec_start_time: "{{ lookup('pipe', \"date -u +'%Y-%m-%d %H:%M:%S UTC'\") }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Ensure Graph download URL is available
+          ansible.builtin.fail:
+            msg: "uploadResult.json['@microsoft.graph.downloadUrl'] is missing. Enable return_content: yes on the upload task and verify upload succeeded."
+          when: >
+            uploadResult is not defined or
+            uploadResult.json is not defined or
+            uploadResult.json['@microsoft.graph.downloadUrl'] is not defined or
+            (uploadResult.json['@microsoft.graph.downloadUrl'] | length) == 0
+          delegate_to: localhost
+          run_once: true
+
+        - name: Set report_download_url from Graph response
+          ansible.builtin.set_fact:
+            report_download_url: "{{ uploadResult.json['@microsoft.graph.downloadUrl'] }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Send success email notification via API (use Graph download URL)
+          ansible.builtin.uri:
+            url: "{{ apiUrl }}"
+            method: POST
+            headers:
+              Content-Type: "application/json"
+              x-api-key: "{{ boomiToken }}"
+            body_format: json
+            body:
+              Application: "{{ sgAPI }}"
+              AuthToken: "Bearer {{ sgSecCode }}"
+              Type: "Email"
+              Direction: "1-Way"
+              From: "{{ email_from_address }}"
+              FromName: "Ansible Automation Platform"
+              To: "{{ email_to_recipients }}"
+              Subject: "{{ report_subject }}"
+              Body: |
+                <p>The scheduled Windows IT Audit scan for group '<b>{{ reporting_group_name }}</b>' has completed successfully.</p>
+                <p>The report has been uploaded and can be downloaded via the link below:</p>
+                <p><a href="{{ report_download_url | e }}">Download Compliance Report</a></p>
+                <p>If clicking the link does not work, copy and paste this URL into your browser:</p>
+                <p style="word-break: break-all; white-space: normal; font-family: Consolas, 'Courier New', monospace;">
+                  {{ report_download_url | e }}
+                </p>
+                <hr>
+                <p><b>Execution Details:</b> Job ID {{ tower_job_id | default('N/A') }}, Start Time: {{ exec_start_time }}</p>
+          no_log: false
+          delegate_to: localhost
+          run_once: true
+          when:
+            - send_email_notification | bool
+
+      rescue:
+        # --- This block runs ONLY if any task in the 'block' above fails ---
+        - name: Send FAILURE email notification via API
+          ansible.builtin.uri:
+            url: "{{ apiUrl }}"
+            method: POST
+            headers:
+              Content-Type: "application/json"
+              x-api-key: "{{ boomiToken }}"
+            body_format: json
+            body:
+              Application: "{{ sgAPI }}"
+              AuthToken: "Bearer {{ sgSecCode }}"
+              Type: "Email"
+              Direction: "1-Way"
+              From: "{{ email_from_address }}"
+              FromName: "Ansible Automation Platform"
+              To: "{{ email_to_recipients }}"
+              Subject: "FAILURE: Windows IT Audit Report for [{{ reporting_group_name }}]"
+              Body: |
+                <p>The Windows IT Audit scan for group '<b>{{ reporting_group_name }}</b>' has <b>FAILED</b>.</p>
+                <p>The report could not be generated or distributed. Please check the Ansible job logs for details.</p>
+                <hr>
+                <p><b>Error Details:</b></p>
+                <pre>{{ ansible_failed_result | to_nice_json }}</pre>
+          no_log: false
+          when:
+            - send_email_notification | bool
+
+

@@ -1,0 +1,401 @@
+---
+# A23: SQL Server Database Level Audit Configuration Check (SQL Server 2017 Fixed)
+- name: A23 | SQL Server database level audit configuration check and audit
+  ansible.windows.win_powershell:
+    script: |
+      Write-Output "=== SQL Server Database Level Audit Configuration Check ==="
+      Write-Output "Current User: $env:USERNAME"
+      Write-Output "Domain User: $env:USERDOMAIN\$env:USERNAME"
+      Write-Output ""
+      
+      # Use the same instance discovery as main.yml for consistency
+      function Get-SQLServerInstances {
+        $instances = @()
+        
+        # Method 1: Check registry for installed instances
+        $regPaths = @(
+          "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+        )
+        
+        foreach ($regPath in $regPaths) {
+          if (Test-Path $regPath) {
+            try {
+              $installedInstances = Get-ItemProperty "$regPath" -Name "InstalledInstances" -ErrorAction SilentlyContinue
+              if ($installedInstances.InstalledInstances) {
+                foreach ($instance in $installedInstances.InstalledInstances) {
+                  if ($instance -eq "MSSQLSERVER") {
+                    if ($instances -notcontains "localhost") {
+                      $instances += "localhost"
+                    }
+                  } else {
+                    $namedInstance = "localhost\$instance"
+                    if ($instances -notcontains $namedInstance) {
+                      $instances += $namedInstance
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        
+        # Method 2: Check running SQL services for named instances
+        try {
+          $sqlServices = Get-Service -Name "MSSQL`$*" -ErrorAction SilentlyContinue
+          foreach ($service in $sqlServices) {
+            if ($service.Name -match "MSSQL\$(.+)") {
+              $instanceName = $matches[1]
+              $instanceConn = "localhost\$instanceName"
+              if ($instances -notcontains $instanceConn) {
+                $instances += $instanceConn
+              }
+            }
+          }
+        } catch {}
+        
+        # Method 3: Check default instance service
+        try {
+          $defaultService = Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue
+          if ($defaultService -and $instances -notcontains "localhost") {
+            $instances += "localhost"
+          }
+        } catch {}
+        
+        # Fallback: If no instances found, add localhost only
+        if ($instances.Count -eq 0) {
+          $instances += "localhost"
+        }
+        
+        return ($instances | Sort-Object -Unique)
+      }
+      
+      # Get all instances
+      $allInstances = Get-SQLServerInstances
+      Write-Output "=== A23 Audit Target Instances ==="
+      foreach ($inst in $allInstances) {
+        Write-Output "Target instance: $inst"
+      }
+      Write-Output ""
+      
+      # Test connections and run audit if successful
+      $successfulConnections = @()
+      $failedConnections = @()
+      $totalAuditCount = 0
+      $canListAuditConfig = $false
+      $failureReason = ""
+      
+      foreach ($instance in $allInstances) {
+        try {
+          $connStr = "Server=$instance;Integrated Security=true;Connection Timeout=5;TrustServerCertificate=true"
+          $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+          $conn.Open()
+          
+          # Get user and permission info
+          $cmd = New-Object System.Data.SqlClient.SqlCommand("SELECT SUSER_NAME() AS CurrentUser, IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin, @@VERSION AS SQLVersion, @@SERVERNAME AS ServerName", $conn)
+          $reader = $cmd.ExecuteReader()
+          
+          if ($reader.Read()) {
+            $currentUser = $reader["CurrentUser"].ToString()
+            $isSysAdmin = $reader["IsSysAdmin"]
+            $sqlVersion = $reader["SQLVersion"].ToString()
+            $serverName = $reader["ServerName"].ToString()
+            
+            $successfulConnections += @{
+              "Instance" = $instance
+              "ServerName" = $serverName
+              "SQLUser" = $currentUser
+              "IsSysAdmin" = ($isSysAdmin -eq 1)
+              "SQLVersion" = $sqlVersion.Split([char]10)[0]
+            }
+          }
+          $reader.Close()
+          
+          # If we have sysadmin, run the audit configuration check immediately
+          if ($isSysAdmin -eq 1) {
+            $canListAuditConfig = $true
+            Write-Output "========================================"
+            Write-Output "AUDITING AUDIT CONFIGURATION: $instance"
+            Write-Output "========================================"
+            
+            Write-Output "Server Name: $serverName"
+            Write-Output "SQL Version: $($sqlVersion.Split([char]10)[0])"
+            Write-Output ""
+            
+            # Get server-level audit configuration (SQL Server 2017 actual column names)
+            try {
+              # FIXED: Use only the columns that actually exist in SQL Server 2017
+              $auditConfigQuery = "SELECT "
+              $auditConfigQuery += "a.name AS AuditName, "
+              $auditConfigQuery += "a.queue_delay AS QueueDelay, "
+              $auditConfigQuery += "CASE a.on_failure "
+              $auditConfigQuery += "  WHEN 0 THEN 'Continue' "
+              $auditConfigQuery += "  WHEN 1 THEN 'Shut down server instance' "
+              $auditConfigQuery += "  WHEN 2 THEN 'Fail operation' "
+              $auditConfigQuery += "  ELSE 'Unknown' "
+              $auditConfigQuery += "END AS OnAuditLogFailure, "
+              $auditConfigQuery += "CASE a.type "
+              $auditConfigQuery += "  WHEN 'FL' THEN 'File' "
+              $auditConfigQuery += "  WHEN 'SL' THEN 'Security Log' "
+              $auditConfigQuery += "  WHEN 'AL' THEN 'Application Log' "
+              $auditConfigQuery += "  ELSE 'Unknown' "
+              $auditConfigQuery += "END AS AuditDestination, "
+              # Only use basic columns that exist in SQL Server 2017
+              $auditConfigQuery += "CASE a.is_state_enabled WHEN 1 THEN 'Enabled' ELSE 'Disabled' END AS AuditStatus "
+              $auditConfigQuery += "FROM sys.server_audits a "
+              $auditConfigQuery += "ORDER BY a.name"
+              
+              $auditCmd = New-Object System.Data.SqlClient.SqlCommand($auditConfigQuery, $conn)
+              $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($auditCmd)
+              $table = New-Object System.Data.DataTable
+              $adapter.Fill($table)
+              
+              Write-Output "Total Server Audits Found: $($table.Rows.Count)"
+              $totalAuditCount += $table.Rows.Count
+              Write-Output ""
+              
+              if ($table.Rows.Count -gt 0) {
+                Write-Output "=== SERVER AUDIT CONFIGURATION ==="
+                Write-Output ""
+                
+                foreach ($row in $table.Rows) {
+                  Write-Output "Audit name: $($row['AuditName'])"
+                  Write-Output "Queue delay: $($row['QueueDelay']) (milliseconds)"
+                  Write-Output "On Audit Log Failure: $($row['OnAuditLogFailure'])"
+                  Write-Output "Audit destination: $($row['AuditDestination'])"
+                  Write-Output "Audit Status: $($row['AuditStatus'])"
+                  Write-Output ""
+                }
+              } else {
+                Write-Output "=== SERVER AUDIT CONFIGURATION ==="
+                Write-Output "No server audits configured on this instance."
+                Write-Output ""
+              }
+            } catch {
+              Write-Output "=== SERVER AUDIT CONFIGURATION ==="
+              Write-Output "Error querying server audits: $($_.Exception.Message)"
+              Write-Output ""
+            }
+            
+            # Get database audit specifications (simplified for SQL Server 2017)
+            try {
+              # First, get all databases
+              $dbListQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0"
+              $dbListCmd = New-Object System.Data.SqlClient.SqlCommand($dbListQuery, $conn)
+              $dbAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($dbListCmd)
+              $dbListTable = New-Object System.Data.DataTable
+              $dbAdapter.Fill($dbListTable)
+              
+              $allDbAuditSpecs = @()
+              
+              # Check each database for audit specifications
+              foreach ($dbRow in $dbListTable.Rows) {
+                $dbName = $dbRow["name"]
+                try {
+                  # Simple query for each database
+                  $dbSpecQuery = "USE [$dbName]; SELECT "
+                  $dbSpecQuery += "das.name AS DatabaseAuditSpecName, "
+                  $dbSpecQuery += "'$dbName' AS DatabaseName, "
+                  $dbSpecQuery += "sa.name AS ServerAuditName, "
+                  $dbSpecQuery += "CASE das.is_state_enabled WHEN 1 THEN 'Enabled' ELSE 'Disabled' END AS SpecificationStatus "
+                  $dbSpecQuery += "FROM sys.database_audit_specifications das "
+                  $dbSpecQuery += "INNER JOIN sys.server_audits sa ON das.audit_guid = sa.audit_guid"
+                  
+                  $dbSpecCmd = New-Object System.Data.SqlClient.SqlCommand($dbSpecQuery, $conn)
+                  $dbSpecAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($dbSpecCmd)
+                  $dbSpecTable = New-Object System.Data.DataTable
+                  $dbSpecAdapter.Fill($dbSpecTable)
+                  
+                  foreach ($specRow in $dbSpecTable.Rows) {
+                    $allDbAuditSpecs += @{
+                      "DatabaseAuditSpecName" = $specRow["DatabaseAuditSpecName"]
+                      "DatabaseName" = $specRow["DatabaseName"]
+                      "ServerAuditName" = $specRow["ServerAuditName"]
+                      "SpecificationStatus" = $specRow["SpecificationStatus"]
+                    }
+                  }
+                } catch {
+                  # Skip databases that can't be accessed
+                }
+              }
+              
+              if ($allDbAuditSpecs.Count -gt 0) {
+                Write-Output "=== DATABASE AUDIT SPECIFICATIONS ==="
+                Write-Output ""
+                Write-Output "DatabaseAuditSpecName`tDatabaseName`tServerAuditName`tSpecificationStatus"
+                Write-Output "----------------------------------------------------------------------------------------"
+                
+                foreach ($spec in $allDbAuditSpecs) {
+                  Write-Output "$($spec.DatabaseAuditSpecName)`t$($spec.DatabaseName)`t$($spec.ServerAuditName)`t$($spec.SpecificationStatus)"
+                }
+                Write-Output ""
+              } else {
+                Write-Output "=== DATABASE AUDIT SPECIFICATIONS ==="
+                Write-Output "No database audit specifications configured."
+                Write-Output ""
+              }
+            } catch {
+              Write-Output "=== DATABASE AUDIT SPECIFICATIONS ==="
+              Write-Output "Error querying database audit specifications: $($_.Exception.Message)"
+              Write-Output ""
+            }
+          }
+          
+          $conn.Close()
+          
+        } catch {
+          $failedConnections += @{
+            "Instance" = $instance
+            "Error" = $_.Exception.Message
+          }
+        }
+      }
+      
+      # Determine failure reason
+      if (-not $canListAuditConfig) {
+        if ($successfulConnections.Count -eq 0) {
+          $failureReason = "Cannot connect to any SQL Server instances"
+        } else {
+          $failureReason = "Connected but no sysadmin privileges to list audit configuration"
+        }
+      } elseif ($totalAuditCount -eq 0) {
+        $failureReason = "No audits configured on any SQL Server instances"
+      }
+      
+      Write-Output "========================================"
+      Write-Output "FINAL SUMMARY"
+      Write-Output "========================================"
+      Write-Output "Total Instances Found: $($allInstances.Count)"
+      Write-Output "Successful Connections: $($successfulConnections.Count)"
+      Write-Output "Failed Connections: $($failedConnections.Count)"
+      Write-Output "Can List Audit Config: $canListAuditConfig"
+      Write-Output "Total Server Audits Across All Instances: $totalAuditCount"
+      Write-Output ""
+      
+      if ($successfulConnections.Count -gt 0) {
+        Write-Output "=== SUCCESSFUL CONNECTIONS ==="
+        foreach ($conn in $successfulConnections) {
+          Write-Output "Instance: $($conn.Instance) ($($conn.ServerName))"
+          Write-Output "  SQL User: $($conn.SQLUser)"
+          if ($conn.IsSysAdmin) {
+            Write-Output "  Permissions: SYSADMIN - CAN LIST AUDIT CONFIGURATION"
+          } else {
+            Write-Output "  Permissions: NO SYSADMIN - CANNOT LIST AUDIT CONFIGURATION"
+          }
+        }
+      }
+      
+      # Overall status - CHANGED: Now fails if no audits are configured
+      if (-not $canListAuditConfig) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - $failureReason"
+      } elseif ($totalAuditCount -eq 0) {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: FAIL - No audits configured on any SQL Server instances"
+      } else {
+        Write-Output ""
+        Write-Output "OVERALL STATUS: OK - Audits are configured and accessible"
+      }
+      
+      Write-Output "Combined audit configuration check and audit completed"
+  register: sql_audit_config_result
+
+- name: Display audit configuration audit results
+  debug:
+    var: sql_audit_config_result.output
+
+- name: Set SQL audit configuration audit status
+  set_fact:
+    sql_can_connect: "{{ 'Successful Connections:' in (sql_audit_config_result.output | join(' ')) and not 'Successful Connections: 0' in (sql_audit_config_result.output | join(' ')) }}"
+    sql_can_list_audit_config: "{{ 'Can List Audit Config: True' in (sql_audit_config_result.output | join(' ')) }}"
+    sql_has_audits_configured: "{{ 'Total Server Audits Across All Instances: 0' not in (sql_audit_config_result.output | join(' ')) }}"
+    sql_failure_reason: "{{ (sql_audit_config_result.output | select('match', '^Failure Reason: .*') | first | default('Failure Reason: Unknown') | regex_replace('^Failure Reason: ', '')) if 'Failure Reason:' in (sql_audit_config_result.output | join(' ')) else '' }}"
+
+- name: Show audit configuration audit final status
+  debug:
+    msg: |
+      FINAL SQL SERVER AUDIT CONFIGURATION AUDIT STATUS:
+      
+      Can Connect to SQL Server: {{ sql_can_connect }}
+      Can List Audit Configuration: {{ sql_can_list_audit_config }}
+      Has Audits Configured: {{ sql_has_audits_configured }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      
+      {% if sql_can_list_audit_config and sql_has_audits_configured %}
+      RESULT: OK - Audits are configured and accessible
+      {% else %}
+      RESULT: FAIL - {% if not sql_can_list_audit_config %}Cannot list audit configuration{% else %}No audits configured{% endif %}
+      {% endif %}
+
+- name: A23 | Build audit configuration audit details for all scenarios
+  set_fact:
+    a23_audit_config_details: |
+      {%- if sql_can_list_audit_config | default(false) and sql_audit_config_result.output is defined -%}
+      {%- for line in sql_audit_config_result.output -%}
+      {{ line }}
+      {% endfor -%}
+      {%- elif sql_can_connect | default(false) -%}
+      SQL Server connection successful but insufficient privileges.
+      Current user can connect but does not have sysadmin role membership.
+      Sysadmin privileges required to query audit configuration.
+      {%- elif sql_audit_config_result.output is defined -%}
+      SQL Server connection attempt made but failed.
+      {% for line in sql_audit_config_result.output %}{{ line }}
+      {% endfor %}
+      {%- else -%}
+      SQL Server not detected or accessible on this system.
+      No SQL Server services found or connection attempts failed.
+      {%- endif -%}
+
+- name: A23 | Determine audit configuration audit status for all hosts
+  set_fact:
+    a23_status: >-
+      {%- if sql_can_list_audit_config | default(false) and sql_has_audits_configured | default(false) -%}
+      OK
+      {%- else -%}
+      Fail
+      {%- endif -%}
+
+- name: A23 | Build expected and actual text for all hosts
+  set_fact:
+    a23_expected_text: |-
+      Status is OK when SQL Server has audit configuration enabled.
+      Status is FAIL when no audits are configured or cannot access audit settings.
+    a23_actual_text: "{{ a23_audit_config_details }}"
+
+- name: A23 | Add to OS checks structure
+  set_fact:
+    win_os_checks_struct: >-
+      {{
+        win_os_checks_struct |
+        combine({
+          inventory_hostname: (
+            win_os_checks_struct[inventory_hostname] |
+            combine({
+              'checks': (win_os_checks_struct[inventory_hostname].checks + [{
+                'control': 'A23',
+                'method': 'T-SQL: sys.server_audits + sys.database_audit_specifications queries (audit configuration)',
+                'expected': a23_expected_text,
+                'actual': a23_actual_text,
+                'status': a23_status
+              }])
+            }, recursive=True)
+          )
+        }, recursive=True)
+      }}
+
+- name: A23 | Debug - Show OS structure for this host
+  debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      MSSQL Detected: {{ mssql_detected | default(false) }}
+      Can Connect: {{ sql_can_connect | default(false) }}
+      Can List Audit Config: {{ sql_can_list_audit_config | default(false) }}
+      Has Audits Configured: {{ sql_has_audits_configured | default(false) }}
+      {% if sql_failure_reason %}
+      Failure Reason: {{ sql_failure_reason }}
+      {% endif %}
+      Status: {{ a23_status }}
+      Added to OS Checks: {{ (win_os_checks_struct[inventory_hostname].checks | selectattr('control', 'equalto', 'A23') | list | length) > 0 }}
