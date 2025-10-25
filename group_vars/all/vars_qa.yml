@@ -1,3 +1,5 @@
+# group_vars/all/vars_qa.yml
+
 # RHEL-ITAUDIT-REPORT/group_vars/all/vars.yml
 # ===================================================================
 # GLOBAL CONFIGURATION

@@ -1,21 +1,5 @@
+#defaults/main.yml
 ---
-# Global policy defaults
-#policy:
-#  password:
-#    min_length: 14
-#    max_age_days: 365
-#    history: 8
-#    complexity: true
-#  lockout:
-#    threshold_min: 5
-#    duration_min: 0
-#    window_min: 55
-#  logs:
-#    security_min_mb: 1024
-#    system_min_mb: 512
-#    application_min_mb: 512
-#  updates:
-#    max_days_since_cu: 45
 
 # Approved members that may appear in local Administrators group
 approved_admins:
