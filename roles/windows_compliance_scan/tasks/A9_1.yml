@@ -129,7 +129,9 @@
             Write-Output ""
             
             # Get login information
-            $query = "SELECT sp.name AS LoginName, sp.type_desc AS LoginType, sp.is_disabled AS IsDisabled, sp.create_date AS CreateDate, sp.default_database_name AS DefaultDatabase FROM sys.server_principals sp WHERE sp.type IN ('S', 'U', 'G') ORDER BY sp.name"
+            # $query = "SELECT sp.name AS LoginName, sp.type_desc AS LoginType, sp.is_disabled AS IsDisabled, sp.create_date AS CreateDate, sp.default_database_name AS DefaultDatabase FROM sys.server_principals sp WHERE sp.type IN ('S', 'U', 'G') ORDER BY sp.name"
+            $query = "SELECT sp.name AS LoginName, sp.type_desc AS LoginType, sp.is_disabled AS IsDisabled, sp.create_date AS CreateDate, sp.default_database_name AS DefaultDatabase FROM sys.server_principals sp WHERE sp.type IN ('S', 'U', 'G', 'C', 'K', 'E', 'X') AND sp.name NOT LIKE '##%' ORDER BY sp.name"
+
             
             $auditCmd = New-Object System.Data.SqlClient.SqlCommand($query, $conn)
             $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($auditCmd)
