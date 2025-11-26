@@ -5,20 +5,45 @@
   ansible.windows.win_powershell:
     script: |
       try {
-        # Get all local users
+        # 1. Get all local users
         $localUsers = Get-LocalUser | Select-Object Name, Enabled, Description, LastLogon, PasswordRequired, PasswordExpires, UserMayChangePassword
         
-        # Get Administrator group members (handle different languages)
-        $adminGroupSid = "S-1-5-32-544"  # Built-in Administrators group SID
+        # 2. Identify the Administrators group (using SID for safety)
+        $adminGroupSid = "S-1-5-32-544" 
         $adminGroup = Get-LocalGroup | Where-Object { $_.SID -eq $adminGroupSid }
         $adminMembers = @()
         
         if ($adminGroup) {
           try {
-            $adminMembers = Get-LocalGroupMember -Group $adminGroup.Name | Select-Object Name, ObjectClass, PrincipalSource
+            # Try the modern cmdlet first
+            $adminMembers = Get-LocalGroupMember -Group $adminGroup.Name -ErrorAction Stop | Select-Object Name, ObjectClass, PrincipalSource
           } catch {
-            # If Get-LocalGroupMember fails, try alternative method
-            $adminMembers = @()
+            # === FIX START: Fallback to ADSI if the cmdlet fails ===
+            # This handles orphaned SIDs or domain connectivity issues that break Get-LocalGroupMember
+            try {
+                $groupName = $adminGroup.Name
+                $adsiGroup = [ADSI]"WinNT://$env:COMPUTERNAME/$groupName,group"
+                $members = @($adsiGroup.psbase.Invoke("Members"))
+                
+                $adminMembers = $members | ForEach-Object {
+                    $mName = $_.GetType().InvokeMember("Name", 'GetProperty', $null, $_, $null)
+                    $mClass = $_.GetType().InvokeMember("Class", 'GetProperty', $null, $_, $null)
+                    $mPath = $_.GetType().InvokeMember("ADsPath", 'GetProperty', $null, $_, $null)
+                    
+                    # Determine PrincipalSource based on path
+                    $source = if ($mPath -match "WinNT://$env:COMPUTERNAME") { "Local" } else { "Domain/Unknown" }
+
+                    @{
+                        Name = $mName
+                        ObjectClass = $mClass
+                        PrincipalSource = $source
+                    }
+                }
+            } catch {
+                # If even ADSI fails, return the specific error text so we know why
+                $adminMembers = @(@{ Name = "Error: " + $_.Exception.Message; ObjectClass = "Error"; PrincipalSource = "Error" })
+            }
+            # === FIX END ===
           }
         }
         
