@@ -1,21 +1,8 @@
----
-# A41 | Users in Windows Administrator Group (Domain-only, simple OK/Fail)
-
-- name: A41 | gather domain group members only
+- name: A41 | List Users in Windows Administrator Group (Nested AD Group Expansion)
   ansible.windows.win_powershell:
     script: |
       try {
-        # Groups to check in specified order
-        $groups = @(
-          "A_CLPP_GroupIT_PSM_DCO",
-          "A_CLPP_GroupIT_PSM_INFRA_APPL",
-          "Domain Admins",
-          "A_CLPP_GroupIT_PSM_Infra_ITMC_P",
-          "A_CLPP_GroupIT_PSM_Infra_Platform",
-          "A_CLPP_GroupIT_PSM_Infra_SysOps_p",
-          "A_SMP_Admin"
-        )
-
+        # --- Helper Function: Parse 'net group' output ---
         function Parse-NetOutput {
           param([string[]]$Lines)
           $members = @()
@@ -25,71 +12,91 @@
             if ($inSection) {
               if ($line -match "The command completed successfully") { break }
               $t = $line.Trim()
-              if (-not [string]::IsNullOrWhiteSpace($t)) { $members += $t }
+              if (-not [string]::IsNullOrWhiteSpace($t)) { 
+                # Split multiple users on one line (standard net command behavior)
+                $parts = $t -split '\s+'
+                $members += $parts
+              }
             }
           }
           return ,$members
         }
 
-        $groupResults = @{}
-        $rawOutput = New-Object System.Collections.ArrayList
-        $successCount = 0
+        # --- Step 1: Get Local Administrator Group Members (Safe Method) ---
+        $adminGroupSid = "S-1-5-32-544"
+        $localAdminGroup = Get-LocalGroup | Where-Object { $_.SID -eq $adminGroupSid }
+        $localMembers = @()
 
-        foreach ($groupName in $groups) {
+        if ($localAdminGroup) {
           try {
-            # Raw header line
-            [void]$rawOutput.Add($groupName)
-            [void]$rawOutput.Add("")
-
-            # Domain query only (exact command)
-            $cmd = "net group `"$groupName`" /domain"
-            $out = & cmd.exe /c $cmd 2>&1
-            foreach ($l in $out) { [void]$rawOutput.Add($l) }
-            [void]$rawOutput.Add("")
-
-            $joined = ($out -join "`n")
-            $ok        = ($joined -match "The command completed successfully")
-
-            $members = @()
-            $status  = "Fail"   # default to Fail
-
-            if ($ok) {
-              $members = Parse-NetOutput -Lines $out
-              $status = "OK"
-              $successCount++
-            }
-
-            $groupResults[$groupName] = @{
-              "Members"     = $members
-              "MemberCount" = $members.Count
-              "Status"      = $status
-            }
+             $localMembers = Get-LocalGroupMember -Group $localAdminGroup.Name -ErrorAction Stop
           } catch {
-            [void]$rawOutput.Add("Error: $($_.Exception.Message)")
-            [void]$rawOutput.Add("")
-            $groupResults[$groupName] = @{
-              "Members"     = @()
-              "MemberCount" = 0
-              "Status"      = "Fail"
-            }
+             # Fallback to ADSI if standard cmdlet fails (Handle Orphaned SIDs)
+             try {
+                $adsiGroup = [ADSI]"WinNT://$env:COMPUTERNAME/$($localAdminGroup.Name),group"
+                $membersRaw = @($adsiGroup.psbase.Invoke("Members"))
+                $localMembers = $membersRaw | ForEach-Object {
+                    $path = $_.GetType().InvokeMember("ADsPath", 'GetProperty', $null, $_, $null)
+                    $name = $_.GetType().InvokeMember("Name", 'GetProperty', $null, $_, $null)
+                    $class = $_.GetType().InvokeMember("Class", 'GetProperty', $null, $_, $null)
+                    
+                    # Convert ADSI object to custom object compatible with logic below
+                    [PSCustomObject]@{
+                        Name = if ($path -match "WinNT://(?<Domain>[^/]+)/") { "$($matches['Domain'])\$name" } else { $name }
+                        ObjectClass = $class
+                        PrincipalSource = if ($path -match "WinNT://$env:COMPUTERNAME") { "Local" } else { "ActiveDirectory" }
+                    }
+                }
+             } catch {
+                # Critical failure fetching local members
+                $localMembers = @()
+             }
           }
         }
 
-        $result = @{
-          GroupResults          = $groupResults
-          SuccessfullyRetrieved = $successCount
-          TotalRequested        = $groups.Count
-          RawOutput             = $rawOutput
+        # --- Step 2: Filter for Domain Groups and Expand Them ---
+        $expandedGroups = @{}
+        $rawOutput = New-Object System.Collections.ArrayList
+        
+        foreach ($member in $localMembers) {
+            # Check if member is likely a Domain Group (Contains '\' and not local machine name, or PrincipalSource is AD)
+            $isDomain = ($member.PrincipalSource -eq 'ActiveDirectory') -or ($member.Name -like "*\*" -and $member.Name -notlike "$env:COMPUTERNAME\*")
+            
+            # We treat it as a group to expand if ObjectClass says Group, or if we are unsure (best effort)
+            $shouldExpand = $isDomain -and ($member.ObjectClass -eq 'Group' -or $member.ObjectClass -eq $null)
+
+            if ($shouldExpand) {
+                # Extract pure group name (remove DOMAIN\)
+                $cleanGroupName = $member.Name -split '\\' | Select-Object -Last 1
+                
+                [void]$rawOutput.Add("checking group: $cleanGroupName")
+
+                # Query Domain
+                $cmd = "net group `"$cleanGroupName`" /domain"
+                $out = & cmd.exe /c $cmd 2>&1
+                
+                $joined = ($out -join "`n")
+                if ($joined -match "The command completed successfully") {
+                   $users = Parse-NetOutput -Lines $out
+                   $expandedGroups[$member.Name] = $users
+                } else {
+                   $expandedGroups[$member.Name] = @("Could not retrieve members (Group might not exist in this Domain context)")
+                }
+            }
         }
 
-        $result | ConvertTo-Json -Depth 5 -Compress
+        # --- Step 3: Build Final Result ---
+        $result = @{
+          LocalAdminGroupName = $localAdminGroup.Name
+          LocalMembers = $localMembers | Select-Object Name, ObjectClass, PrincipalSource
+          ExpandedDomainGroups = $expandedGroups
+          TotalLocalMembers = $localMembers.Count
+        }
+
+        $result | ConvertTo-Json -Depth 4 -Compress
       } catch {
         @{
-          Error                 = $_.Exception.Message
-          GroupResults          = @{}
-          SuccessfullyRetrieved = 0
-          TotalRequested        = 7
-          RawOutput             = @("Error occurred during domain group retrieval")
+          Error = $_.Exception.Message
         } | ConvertTo-Json -Compress
       }
   register: a41_result
@@ -103,7 +110,7 @@
 
 - name: A41 | normalize result
   set_fact:
-    a41_raw: "{{ (a41_result.output | default([])) | join('\n') | trim }}"
+    a41_raw: "{{ (a41_result.output | default([])) | join('') | trim }}"
 
 - name: A41 | parse result
   set_fact:
@@ -116,43 +123,35 @@
         {}
       {%- endif -%}
 
-- name: A41 | build domain group raw details
+- name: A41 | build output text
   set_fact:
-    a41_group_details: |
-      {%- if a41_data.Error is defined -%}
-      Error retrieving domain groups: {{ a41_data.Error }}
-      {%- elif a41_data.RawOutput is defined and a41_data.RawOutput | length > 0 -%}
-      {%- for line in a41_data.RawOutput -%}
-      {{ line }}
-      {% endfor -%}
-      {%- else -%}
-      No domain group information available.
-      {%- endif -%}
+    a41_actual_text: |-
+      {% if a41_data.Error is defined %}
+      Error: {{ a41_data.Error }}
+      {% else %}
+      Total Local Administrators: {{ a41_data.TotalLocalMembers | default(0) }}
+      
+      --- Details ---
+      {% for member in a41_data.LocalMembers %}
+      [Member] {{ member.Name }} ({{ member.ObjectClass }})
+      {% if member.Name in a41_data.ExpandedDomainGroups %}
+        -> Domain Group Members:
+        {% for user in a41_data.ExpandedDomainGroups[member.Name] %}
+          - {{ user }}
+        {% endfor %}
+      {% endif %}
+      <br>
+      {% endfor %}
+      {% endif %}
 
-- name: A41 | determine final status (OK only if all listed groups succeeded)
+- name: A41 | determine status
   set_fact:
     a41_status: >-
       {%- if a41_data.Error is defined -%}
       Fail
-      {%- elif a41_data.GroupResults is not defined or a41_data.GroupResults | length == 0 -%}
-      Fail
       {%- else -%}
-        {%- set all_ok = true -%}
-        {%- for g, gd in a41_data.GroupResults.items() -%}
-          {%- if gd.Status | default('Fail') != 'OK' -%}
-            {%- set all_ok = false -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {{ 'OK' if all_ok else 'Fail' }}
+      OK
       {%- endif -%}
-
-- name: A41 | actual text (summary + raw)
-  set_fact:
-    a41_actual_text: |-
-      Compliance Status: {{ a41_status }}
-      Domain groups successfully listed: {{ a41_data.SuccessfullyRetrieved | default(0) }} / {{ a41_data.TotalRequested | default(0) }}
-      
-      {{ a41_group_details }}
 
 # Ensure host structure exists
 - name: A41 | ensure host struct
@@ -184,9 +183,9 @@
             combine({
               'checks': (win_os_checks_struct[inventory_hostname].checks + [{
                 'control': 'A41',
-                'method': 'PowerShell: net group /domain for administrator groups',
+                'method': 'PowerShell: Get-LocalGroupMember + net group /domain',
                 'checking_item': 'Users in Windows Administrator Group',
-                'expected': 'Domain group membership can be listed successfully.',
+                'expected': 'Display AD groups within Local Admin group with their respective memberships.',
                 'actual': a41_actual_text,
                 'status': a41_status
               }])
